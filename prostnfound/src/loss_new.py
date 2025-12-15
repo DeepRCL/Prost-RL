@@ -52,21 +52,49 @@ class ProportionBCE(nn.Module):
         self,
         l1_penalty_lambda: float | None = None,
         entropy_penalty_lambda: float | None = None,
+        pos_weight: float = 1.0,
     ):
         super().__init__()
         self.l1_penalty_lambda = l1_penalty_lambda
         self.entropy_penalty_lambda = entropy_penalty_lambda
+        self.pos_weight = pos_weight
 
     def forward(self, bag_of_logits, true_prop):
+        # Numerical stability: use a larger epsilon to prevent underflow
+        eps = 1e-7
+        
+        # Compute probabilities from logits
         probs = bag_of_logits.sigmoid()
+        
+        # Clamp individual probabilities to prevent extreme values
+        probs = probs.clamp(min=eps, max=1 - eps)
+        
+        # Compute mean probability (predicted proportion)
         pred_prob = probs.mean()
-
-        loss = -true_prop * pred_prob.log() - (1 - true_prop) * (1 - pred_prob).log()
-
+        
+        # CRITICAL: Clamp pred_prob before taking log to prevent NaN
+        # This is especially important when model outputs all near-zero values
+        pred_prob = pred_prob.clamp(min=eps, max=1 - eps)
+        
+        # Compute BCE loss on proportions
+        # Use log1p for better numerical stability when computing log(1-x)
+        loss = -true_prop * torch.log(pred_prob) - (1 - true_prop) * torch.log(1 - pred_prob)
+        
+        # Apply positive weight if this is a cancer case
+        if true_prop.item() > 0:
+            loss = loss * self.pos_weight
+            
+        # L1 penalty on individual probabilities (sparsity regularization)
         if self.l1_penalty_lambda:
             loss = loss + self.l1_penalty_lambda * probs.abs().sum()
+            
+        # Entropy penalty for exploration/smoothness
         if self.entropy_penalty_lambda:
-            entropy = -probs * probs.log() - (1 - probs) * (1 - probs).log()
+            # Binary entropy: H(p) = -p*log(p) - (1-p)*log(1-p)
+            # Already clamped probs, so this is safe
+            entropy = -probs * torch.log(probs) - (1 - probs) * torch.log(1 - probs)
+            # Check for NaN in entropy (shouldn't happen with clamping, but be safe)
+            entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
             loss = loss + self.entropy_penalty_lambda * entropy.mean()
 
         return loss
@@ -264,11 +292,12 @@ def build_heatmap_loss(args):
         return CancerDetectionMILLoss()
     elif args.loss == "mil_prop_bce_l1_reg":
         return CancerDetectionMILLoss(
-            base_loss=ProportionBCE(0.001), treat_gg1_as_benign=args.treat_gg1_as_benign
+            base_loss=ProportionBCE(l1_penalty_lambda=0.001, pos_weight=1.0), 
+            treat_gg1_as_benign=args.treat_gg1_as_benign
         )
     elif args.loss == "mil_prop_bce_entropy_reg":
         return CancerDetectionMILLoss(
-            base_loss=ProportionBCE(entropy_penalty_lambda=0.01),
+            base_loss=ProportionBCE(entropy_penalty_lambda=0.01, pos_weight=1.0),
             treat_gg1_as_benign=args.get('treat_gg1_as_benign', False),
         )
 

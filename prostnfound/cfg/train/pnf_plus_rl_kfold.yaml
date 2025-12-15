@@ -6,7 +6,7 @@
 # 4. Patch-based policy option (K patches instead of K points)
 # 5. Improved reward: classification + ROI involvement
 
-name: "HardMask-PPO-Categorical-confidence_based"
+name: "HardMask-PPO-v2-noprompt-Categorical-combined_v2-nobounce"
 
 data:
  fold: 0
@@ -37,7 +37,7 @@ data:
 # Model configuration
 model: prostnfound_rl_adapter_medsam_legacy
 model_kw:
- prompts: [psa,age]
+ prompts: []
  use_class_decoder: true
  # RL-specific parameters
  num_attention_points: 4  # Number of attention points/patches
@@ -69,14 +69,14 @@ rl_mode: grpo  # RL algorithm (pure GRPO without value function)
 
 
 # Reward Configuration (v2)
-rl_reward_mode: combined_v2  # NEW recommended mode
+rl_reward_mode: combined_v2 # NEW recommended mode
  # Options:
  # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
  # - 'confidence_based': Reward high confidence on correct predictions
  # - 'classification_only': Only classification head performance
  # - 'roi_only': Only ROI/heatmap involvement accuracy
  # - 'loss_based': Negative BCE loss (legacy, not recommended)
-rl_cspca_bonus: 1.5  # Bonus multiplier for csPCa cases
+rl_cspca_bonus: 1  # Bonus multiplier for csPCa cases
 
 
 # Reward Composition Weights (for combined_v2 mode)
@@ -109,7 +109,7 @@ rl_prostate_boundary_penalty_scale: 10.0  # Scale factor for distance-based pena
 
 # Optimizer configuration
 optimizer: adamw
-lr: 2.0e-05
+lr: 5.0e-05
 encoder_lr: 8.0e-06
 warmup_lr: 0.00005
 cnn_lr: 1.0e-05
@@ -128,7 +128,8 @@ run_val: true
 
 project: prostnfound_rl
 seed: 30
-tracked_metric: val/core_auc_high_involvement
+# tracked_metric: val/core_auc_high_involvement
+tracked_metric: val/core_auc
 
 
 wandb:

@@ -395,8 +395,9 @@ def run_train_epoch(
             else:
                 optimizer.step()
                 optimizer.zero_grad()
-
-        scheduler.step()
+            
+            # Step scheduler only when optimizer steps
+            scheduler.step()
 
         step_metrics = {f"train/{k}": v for k, v in evaluator(data).items()}
         step_metrics.update({"train_loss": loss.item() * args.accumulate_grad_steps})
@@ -474,6 +475,8 @@ def run_rl_train_epoch_batched(
         # Step 2: GRPO updates with batched forward
         # ============================================
         rl_metrics_list = []
+        supervised_loss_avg = 0.0
+        total_loss_avg = 0.0
         
         for rl_epoch in range(num_rl_updates):
             with torch.amp.autocast('cuda', enabled=args.use_amp):
@@ -498,7 +501,12 @@ def run_rl_train_epoch_batched(
                 rl_weight = args.get('rl_loss_weight', 1.0)
                 total_loss = supervised_loss + rl_weight * rl_loss
                 rl_metrics_list.append(rl_info)
+                
+                # Accumulate for logging (average across RL updates)
+                supervised_loss_avg += supervised_loss.item()
+                total_loss_avg += total_loss.item()
 
+            # Scale loss by accumulate_grad_steps for gradient accumulation
             total_loss = total_loss / args.accumulate_grad_steps
             
             if args.use_amp:
@@ -506,25 +514,32 @@ def run_rl_train_epoch_batched(
             else:
                 total_loss.backward()
 
-            if (train_iter + 1) % args.accumulate_grad_steps == 0:
-                if args.use_amp:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        args.get('rl_max_grad_norm', 0.5)
-                    )
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad()
-                else:
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        args.get('rl_max_grad_norm', 0.5)
-                    )
-                    optimizer.step()
-                    optimizer.zero_grad()
-
-        scheduler.step()
+        # Step optimizer and scheduler ONCE per batch (after all RL updates)
+        # This ensures gradients from all RL update epochs are accumulated before stepping
+        if (train_iter + 1) % args.accumulate_grad_steps == 0:
+            if args.use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.get('rl_max_grad_norm', 0.5)
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.get('rl_max_grad_norm', 0.5)
+                )
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            # Step scheduler only when optimizer steps
+            scheduler.step()
+        
+        # Average losses across RL updates for logging
+        supervised_loss_avg = supervised_loss_avg / num_rl_updates
+        total_loss_avg = total_loss_avg / num_rl_updates
 
         # ============================================
         # Step 3: Logging
@@ -536,8 +551,8 @@ def run_rl_train_epoch_batched(
         
         step_metrics = {f"train/{k}": v for k, v in evaluator(eval_data).items()}
         step_metrics.update({
-            "train_loss": supervised_loss.item(),
-            "train_total_loss": total_loss.item() * args.accumulate_grad_steps,
+            "train_loss": supervised_loss_avg,
+            "train_total_loss": total_loss_avg * args.accumulate_grad_steps,
         })
         
         # Add RL metrics

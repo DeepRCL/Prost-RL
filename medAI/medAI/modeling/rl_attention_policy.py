@@ -192,28 +192,57 @@ class RLAttentionPolicy(nn.Module):
         
         # Sample or select top-k points
         if deterministic:
-            # Handle all-masked case: if all logits are -inf, use uniform fallback
-            all_inf_mask = (attention_logits == float('-inf')).all(dim=1)
-            if all_inf_mask.any():
-                # Replace with uniform for samples that are completely masked
-                attention_logits = attention_logits.clone()
-                uniform_logit = 0.0  # All equal logits → uniform distribution
-                attention_logits[all_inf_mask] = uniform_logit
+            # CRITICAL FIX: In deterministic mode, we must ensure selected points are NOT -inf
+            # (i.e., they are inside the prostate mask when constraint is enabled)
             
-            # Select top-k points
-            top_k_indices = torch.topk(attention_logits, k=self.num_attention_points, dim=1).indices
-            coords_flat = top_k_indices  # B x k
+            # Create mask of valid (non -inf) positions
+            valid_positions = attention_logits != float('-inf')  # B x (H*W)
             
-            # Compute log probs for selected points (handle -inf gracefully)
-            # Replace -inf with a very small finite value for log_softmax stability
-            safe_logits = attention_logits.clone()
-            safe_logits = torch.where(
-                safe_logits == float('-inf'),
-                torch.full_like(safe_logits, -100.0),
-                safe_logits
-            )
-            log_probs = F.log_softmax(safe_logits, dim=1)
-            selected_log_probs = torch.gather(log_probs, 1, coords_flat)  # B x k
+            # Handle each sample in the batch individually
+            coords_flat_list = []
+            log_probs_list = []
+            
+            for b in range(B):
+                valid_b = valid_positions[b]  # (H*W,)
+                logits_b = attention_logits[b]  # (H*W,)
+                
+                # Count valid positions
+                num_valid = valid_b.sum().item()
+                
+                if num_valid == 0:
+                    # Edge case: no valid positions (shouldn't happen with proper masking)
+                    # Fall back to uniform sampling across all positions
+                    selected_indices = torch.randperm(logits_b.shape[0], device=logits_b.device)[:self.num_attention_points]
+                elif num_valid < self.num_attention_points:
+                    # Not enough valid positions: select all valid ones + sample extras
+                    valid_indices = torch.where(valid_b)[0]
+                    # Repeat selection from valid positions to reach k points
+                    extra_needed = self.num_attention_points - num_valid
+                    extra_indices = valid_indices[torch.randint(0, num_valid, (extra_needed,), device=valid_indices.device)]
+                    selected_indices = torch.cat([valid_indices, extra_indices])
+                else:
+                    # Enough valid positions: select top-k from valid positions only
+                    # Set invalid positions to very negative value so topk ignores them
+                    masked_logits = logits_b.clone()
+                    masked_logits[~valid_b] = -1e9  # Use large negative instead of -inf for topk
+                    selected_indices = torch.topk(masked_logits, k=self.num_attention_points, dim=0).indices
+                
+                coords_flat_list.append(selected_indices)
+                
+                # Compute log probs for selected points
+                # Replace -inf with finite value for log_softmax stability
+                safe_logits_b = logits_b.clone()
+                safe_logits_b = torch.where(
+                    safe_logits_b == float('-inf'),
+                    torch.full_like(safe_logits_b, -100.0),
+                    safe_logits_b
+                )
+                log_probs_b = F.log_softmax(safe_logits_b, dim=0)
+                selected_log_probs_b = log_probs_b[selected_indices]
+                log_probs_list.append(selected_log_probs_b)
+            
+            coords_flat = torch.stack(coords_flat_list, dim=0)  # B x k
+            selected_log_probs = torch.stack(log_probs_list, dim=0)  # B x k
         else:
             # Sample from categorical distribution
             # Use log-softmax for numerical stability, then exponentiate
