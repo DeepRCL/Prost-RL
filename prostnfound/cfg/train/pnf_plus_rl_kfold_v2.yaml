@@ -6,7 +6,7 @@
 # 4. Patch-based policy option (K patches instead of K points)
 # 5. Improved reward: classification + ROI involvement
 
-name: "HardMask-PPO-noprompt-categorical-classification_only-loss"
+name: "HardMask-PPO-with-prompts-categorical-classification_only-loss"
 
 data:
  fold: 0
@@ -37,7 +37,7 @@ data:
 # Model configuration
 model: prostnfound_rl_adapter_medsam_legacy
 model_kw:
- prompts: []
+ prompts: [age, psa, psad, pos]
  use_class_decoder: true
  # RL-specific parameters
  num_attention_points: 4  # Number of attention points/patches
