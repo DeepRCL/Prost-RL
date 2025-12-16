@@ -1,12 +1,4 @@
-# ProstNFound-RL training configuration (v2 - optimized)
-# Key improvements:
-# 1. Batched forward passes (much faster training)
-# 2. Pure GRPO without value function (like Seg-R1)
-# 3. Configurable prostate mask constraint
-# 4. Patch-based policy option (K patches instead of K points)
-# 5. Improved reward: classification + ROI involvement
-
-name: "HardMask-PPO-noprompt-categorical-classification_only-loss"
+name: "HardMask-GRPO-v2-noprompt-Categorical-combined_v2"
 
 data:
  fold: 0
@@ -53,7 +45,7 @@ model_kw:
  # Architecture version: 'v1' for legacy (old checkpoints), 'v2' for new (deeper)
  policy_arch_version: v2
  # PPO mode: set to true to use value function (requires value head in policy)
- use_value_function: true  # Set to true for PPO-style training
+ use_value_function: false  # Set to true for PPO-style training
 
 
 # Loss configuration
@@ -69,7 +61,7 @@ rl_mode: grpo  # RL algorithm (pure GRPO without value function)
 
 
 # Reward Configuration (v2)
-rl_reward_mode: classification_only # NEW recommended mode
+rl_reward_mode: combined_v2 # NEW recommended mode
  # Options:
  # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
  # - 'confidence_based': Reward high confidence on correct predictions
@@ -109,13 +101,13 @@ rl_prostate_boundary_penalty_scale: 10.0  # Scale factor for distance-based pena
 
 # Optimizer configuration
 optimizer: adamw
-lr: 3.0e-05
+lr: 2.0e-05
 encoder_lr: 8.0e-06
 warmup_lr: 0.00005
 cnn_lr: 1.0e-05
 warmup_epochs: 1
 wd: 0.01
-epochs: 35
+epochs: 30
 accumulate_grad_steps: 1
 cutoff_epoch: null
 scheduler: cosine  # 'cosine' or 'constant'

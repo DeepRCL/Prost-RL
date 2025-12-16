@@ -200,13 +200,19 @@ class GRPO:
         
         policy_loss = -torch.min(surr1, surr2).mean()
         
-        # Compute KL divergence penalty (like Seg-R1)
-        # KL = exp(old - new) - (old - new) - 1
-        per_point_kl = torch.exp(old_log_probs - log_probs) - (old_log_probs - log_probs) - 1
+        # Compute a numerically-stable sampled KL-style penalty (like Seg-R1)
+        # NOTE: This is NOT the exact KL between full action distributions because we only
+        # have log-probs for the sampled actions. Still useful as a stabilizer.
+        # KL = exp(delta) - delta - 1, where delta = old - new
+        delta = old_log_probs - log_probs
+        delta = torch.clamp(delta, min=-20.0, max=20.0)
+        per_point_kl = torch.exp(delta) - delta - 1
         kl = per_point_kl.sum(dim=1).mean()
         
-        # Compute entropy bonus (encourages exploration)
-        entropy = -log_probs.mean()
+        # Entropy bonus: we cannot compute true entropy from log-probs of sampled actions.
+        # Using -mean(log_prob(sampled_action)) is NOT entropy and gives the wrong gradient.
+        # So we disable entropy here unless the policy returns full distribution stats.
+        entropy = torch.zeros((), device=log_probs.device, dtype=log_probs.dtype)
         
         # Total loss (with KL penalty like Seg-R1)
         total_loss = policy_loss + self.kl_coef * kl - self.entropy_coef * entropy

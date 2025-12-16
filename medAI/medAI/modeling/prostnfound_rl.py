@@ -143,6 +143,7 @@ class ProstNFoundRL(nn.Module):
         output_mode: Optional[str] = None,
         deterministic: bool = False,
         return_rl_info: bool = True,
+        rl_action_indices: Optional[torch.Tensor] = None,
         **prompts,
     ) -> Dict[str, Any]:
         """
@@ -198,11 +199,13 @@ class ProstNFoundRL(nn.Module):
         mask_for_policy = prostate_mask if self.use_prostate_mask_constraint else None
         
         if self.policy_type == 'categorical':
-            rl_coords, rl_log_probs, rl_attention_map, rl_value = self.policy(
+            rl_coords, rl_log_probs, rl_attention_map, rl_value, rl_action_indices_out = self.policy(
                 image_feats,
                 clinical_features=clinical_features,
                 deterministic=deterministic,
                 prostate_mask=mask_for_policy,
+                action_indices=rl_action_indices,
+                return_action_indices=True,
             )
         elif self.policy_type == 'patch':
             rl_coords, rl_log_probs, rl_patches, rl_value = self.policy(
@@ -212,6 +215,7 @@ class ProstNFoundRL(nn.Module):
                 prostate_mask=mask_for_policy,
             )
             rl_attention_map = rl_patches  # Store patches for visualization
+            rl_action_indices_out = None
         else:  # gaussian
             rl_coords, rl_log_probs, rl_value = self.policy(
                 image_feats,
@@ -220,16 +224,25 @@ class ProstNFoundRL(nn.Module):
                 prostate_mask=mask_for_policy,
             )
             rl_attention_map = None
+            rl_action_indices_out = None
         
         # Step 3: Encode attention points as sparse prompts using SAM's prompt encoder
         # SAM expects (coords, labels) where labels: 1=foreground, 0=background
         num_points = rl_coords.shape[1]
         point_labels = torch.ones(B, num_points, device=rl_coords.device)
         
-        # CRITICAL: Verify decoder gets the attention points
+        # CRITICAL FIX: Scale coordinates from [0, 256] to [0, 1024] to match SAM's input_image_size
+        # The policy outputs coords in image space [0, 256], but SAM was trained on [0, 1024]
+        # Without this scaling, all attention points are squashed into the top-left quarter!
+        sam_input_size = self.prostnfound.medsam_model.prompt_encoder.input_image_size[0]  # 1024
+        actual_image_size = image.shape[-1]  # 256
+        scale_factor = sam_input_size / actual_image_size  # 1024 / 256 = 4.0
+        rl_coords_scaled = rl_coords * scale_factor
+        
+        # Verify decoder gets the attention points
         # The _embed_points function encodes points into prompt embeddings
         attention_point_embeddings = self.prostnfound.medsam_model.prompt_encoder._embed_points(
-            rl_coords,
+            rl_coords_scaled,
             point_labels,
             pad=False,
         )  # B x num_points x 256
@@ -390,6 +403,8 @@ class ProstNFoundRL(nn.Module):
                 output['rl_log_probs'] = rl_log_probs
                 output['rl_attention_map'] = rl_attention_map
                 output['rl_value'] = rl_value  # Value function output (or None if not using PPO)
+                if rl_action_indices_out is not None:
+                    output['rl_action_indices'] = rl_action_indices_out
             else:
                 output = {
                     'mask_logits': output,
@@ -398,6 +413,8 @@ class ProstNFoundRL(nn.Module):
                     'rl_attention_map': rl_attention_map,
                     'rl_value': rl_value,
                 }
+                if rl_action_indices_out is not None:
+                    output['rl_action_indices'] = rl_action_indices_out
         
         return output
     

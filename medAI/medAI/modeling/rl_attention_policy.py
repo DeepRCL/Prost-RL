@@ -123,6 +123,8 @@ class RLAttentionPolicy(nn.Module):
         clinical_features: Optional[torch.Tensor] = None,
         deterministic: bool = False,
         prostate_mask: Optional[torch.Tensor] = None,
+        action_indices: Optional[torch.Tensor] = None,
+        return_action_indices: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Forward pass to generate attention points.
@@ -190,8 +192,44 @@ class RLAttentionPolicy(nn.Module):
             mask_to_apply = (mask_flat < 0.5) & valid_mask_per_sample  # B x (H*W)
             attention_logits = attention_logits.masked_fill(mask_to_apply, float('-inf'))
         
+        # Helper: compute log-prob of a fixed *sequence* of indices under the
+        # same "without replacement" sampling procedure used in the stochastic branch.
+        def _log_probs_for_fixed_indices(
+            logits: torch.Tensor,  # (B, H*W) possibly containing -inf
+            indices: torch.Tensor,  # (B, k)
+        ) -> torch.Tensor:
+            # Replace -inf with a large negative number for log_softmax stability.
+            logits_work = torch.where(
+                logits == float("-inf"),
+                torch.full_like(logits, -100.0),
+                logits,
+            )
+            probs_work = F.log_softmax(logits_work, dim=1).exp()  # (B, H*W)
+            probs_work = torch.clamp(probs_work, min=1e-8)
+            probs_work = probs_work / probs_work.sum(dim=1, keepdim=True)
+
+            logps = []
+            for t in range(indices.shape[1]):
+                dist = torch.distributions.Categorical(probs=probs_work)
+                idx_t = indices[:, t]
+                logp_t = dist.log_prob(idx_t)  # (B,)
+                logps.append(logp_t)
+                # Remove sampled index (without replacement) and renormalize
+                probs_work = probs_work.scatter(1, idx_t.unsqueeze(1), 1e-8)
+                probs_work = probs_work / probs_work.sum(dim=1, keepdim=True)
+            return torch.stack(logps, dim=1)  # (B, k)
+
+        # If we are evaluating fixed actions (PPO update), do NOT resample.
+        if action_indices is not None:
+            if action_indices.ndim != 2 or action_indices.shape[0] != B:
+                raise ValueError(
+                    f"action_indices must have shape (B, k); got {tuple(action_indices.shape)}"
+                )
+            coords_flat = action_indices.to(device=attention_logits.device, dtype=torch.long)
+            selected_log_probs = _log_probs_for_fixed_indices(attention_logits, coords_flat)
+            action_indices_out = coords_flat
         # Sample or select top-k points
-        if deterministic:
+        elif deterministic:
             # CRITICAL FIX: In deterministic mode, we must ensure selected points are NOT -inf
             # (i.e., they are inside the prostate mask when constraint is enabled)
             
@@ -243,6 +281,7 @@ class RLAttentionPolicy(nn.Module):
             
             coords_flat = torch.stack(coords_flat_list, dim=0)  # B x k
             selected_log_probs = torch.stack(log_probs_list, dim=0)  # B x k
+            action_indices_out = coords_flat
         else:
             # Sample from categorical distribution
             # Use log-softmax for numerical stability, then exponentiate
@@ -277,6 +316,7 @@ class RLAttentionPolicy(nn.Module):
             
             coords_flat = torch.stack(sampled_indices_list, dim=1)  # B x k
             selected_log_probs = torch.stack(log_probs_list, dim=1)  # B x k
+            action_indices_out = coords_flat
         
         # Convert flat indices to (y, x) coordinates
         coords_y = coords_flat // W  # B x k
@@ -291,7 +331,11 @@ class RLAttentionPolicy(nn.Module):
         
         # Stack to (B, k, 2) format [x, y] as SAM expects
         coords = torch.stack([coords_x, coords_y], dim=2)  # B x k x 2
-        
+
+        if return_action_indices:
+            # Keep backward compatibility by only returning this extra tensor when requested.
+            return coords, selected_log_probs, attention_map, value, action_indices_out
+
         return coords, selected_log_probs, attention_map, value
     
     def get_attention_map(self, image_features: torch.Tensor) -> torch.Tensor:

@@ -456,6 +456,9 @@ def run_rl_train_epoch_batched(
             # Extract RL info
             old_log_probs = batched_outputs.get('rl_log_probs').detach()  # (B * num_samples, k)
             batched_coords = batched_outputs.get('rl_attention_coords')
+            # Store the exact discrete actions sampled during the rollout so PPO-style
+            # update epochs reuse the SAME actions (on-policy within the batch).
+            rollout_action_indices = batched_outputs.get('rl_action_indices')
             
             # Compute rewards for all samples in one go (pass num_samples for diversity reward)
             all_rewards = reward_computer(batched_outputs, batched_data, num_samples_per_image=num_samples_per_image)  # (B * num_samples,)
@@ -481,9 +484,19 @@ def run_rl_train_epoch_batched(
         for rl_epoch in range(num_rl_updates):
             with torch.amp.autocast('cuda', enabled=args.use_amp):
                 # Batched forward for current policy (reuse replicated data)
-                current_outputs = model(batched_data, deterministic=False)
+                current_outputs = model(
+                    batched_data,
+                    deterministic=False,
+                    rl_action_indices=rollout_action_indices,
+                )
                 current_log_probs = current_outputs.get('rl_log_probs')  # (B * num_samples, k)
                 current_values = current_outputs.get('rl_value')  # (B * num_samples,) or None
+                
+                if args.debug and rollout_action_indices is not None:
+                    # PPO sanity check: actions must match rollout actions
+                    cur_idx = current_outputs.get('rl_action_indices')
+                    if cur_idx is not None:
+                        assert torch.equal(cur_idx, rollout_action_indices), "RL actions changed during PPO update!"
                 
                 # Supervised loss (use mean over samples for stable training)
                 supervised_loss = criterion(current_outputs)
@@ -514,9 +527,53 @@ def run_rl_train_epoch_batched(
             else:
                 total_loss.backward()
 
-        # Step optimizer and scheduler ONCE per batch (after all RL updates)
-        # This ensures gradients from all RL update epochs are accumulated before stepping
-        if (train_iter + 1) % args.accumulate_grad_steps == 0:
+            # Optional: take an optimizer step per update epoch (more PPO-like).
+            # Default is False to preserve prior behavior and avoid making configs suddenly "more aggressive".
+            if args.get('rl_step_per_update_epoch', False) and args.accumulate_grad_steps == 1:
+                if args.use_amp:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        args.get('rl_max_grad_norm', 0.5)
+                    )
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                else:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        args.get('rl_max_grad_norm', 0.5)
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
+                scheduler.step()
+
+        # If using gradient accumulation across batches, step optimizer ONCE per batch
+        # (after all RL update epochs), as before.
+        if args.accumulate_grad_steps != 1 and (train_iter + 1) % args.accumulate_grad_steps == 0:
+            if args.use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.get('rl_max_grad_norm', 0.5)
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.get('rl_max_grad_norm', 0.5)
+                )
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            # Step scheduler only when optimizer steps
+            scheduler.step()
+        
+        # Handle the default case: accumulate_grad_steps == 1 and not stepping per update epoch
+        # This ensures optimizer steps once per batch after all RL update epochs
+        elif args.accumulate_grad_steps == 1 and not args.get('rl_step_per_update_epoch', False):
             if args.use_amp:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
@@ -713,7 +770,7 @@ class ProstNFoundMeta(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    def forward(self, data, include_postprocessed_heatmaps=False, deterministic=False):
+    def forward(self, data, include_postprocessed_heatmaps=False, deterministic=False, rl_action_indices=None):
         # extracting relevant data from the batch
         bmode = data["bmode"].to(self.device)
         needle_mask = data["needle_mask"].to(self.device)
@@ -741,6 +798,7 @@ class ProstNFoundMeta(nn.Module):
                     output_mode="all", 
                     deterministic=deterministic,
                     return_rl_info=True,
+                    rl_action_indices=rl_action_indices,
                     **prompts
                 )
             else:
@@ -759,6 +817,8 @@ class ProstNFoundMeta(nn.Module):
                 data["rl_log_probs"] = outputs.get("rl_log_probs")
                 data["rl_attention_map"] = outputs.get("rl_attention_map")
                 data["rl_value"] = outputs.get("rl_value")
+                if "rl_action_indices" in outputs:
+                    data["rl_action_indices"] = outputs.get("rl_action_indices")
         else:
             model_outputs = self.model(bmode)
             if isinstance(model_outputs, dict):

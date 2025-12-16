@@ -6,7 +6,7 @@
 # 4. Patch-based policy option (K patches instead of K points)
 # 5. Improved reward: classification + ROI involvement
 
-name: "HardMask-PPO-v2-noprompt-Categorical-combined_v2-nobounce"
+name: "HardMask-PPO-noprompt-gaussian-combined_v2-11"
 
 data:
  fold: 0
@@ -41,7 +41,7 @@ model_kw:
  use_class_decoder: true
  # RL-specific parameters
  num_attention_points: 4  # Number of attention points/patches
- policy_type: categorical  # 'categorical', 'gaussian', or 'patch'
+ policy_type: gaussian  # 'categorical', 'gaussian', or 'patch'
  policy_hidden_dim: 512
  use_clinical_in_policy: true
  freeze_prostnfound: false  # Set to true to only train RL policy
@@ -76,7 +76,7 @@ rl_reward_mode: combined_v2 # NEW recommended mode
  # - 'classification_only': Only classification head performance
  # - 'roi_only': Only ROI/heatmap involvement accuracy
  # - 'loss_based': Negative BCE loss (legacy, not recommended)
-rl_cspca_bonus: 1  # Bonus multiplier for csPCa cases
+rl_cspca_bonus: 2  # Bonus multiplier for csPCa cases
 
 
 # Reward Composition Weights (for combined_v2 mode)
@@ -109,13 +109,13 @@ rl_prostate_boundary_penalty_scale: 10.0  # Scale factor for distance-based pena
 
 # Optimizer configuration
 optimizer: adamw
-lr: 5.0e-05
+lr: 2.0e-05
 encoder_lr: 8.0e-06
 warmup_lr: 0.00005
 cnn_lr: 1.0e-05
 warmup_epochs: 1
 wd: 0.01
-epochs: 20
+epochs: 25
 accumulate_grad_steps: 1
 cutoff_epoch: null
 scheduler: cosine  # 'cosine' or 'constant'
@@ -128,8 +128,7 @@ run_val: true
 
 project: prostnfound_rl
 seed: 30
-# tracked_metric: val/core_auc_high_involvement
-tracked_metric: val/core_auc
+tracked_metric: val/core_auc_high_involvement
 
 
 wandb:

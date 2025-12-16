@@ -223,17 +223,104 @@ def main(args):
         )
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-        show_heatmap_prediction(data)
+        fig = show_heatmap_prediction(data)
+        ax = fig.axes  # Get the axes from the figure
+        
+        # Extract key information for clear display
+        gt_label = data["label"][0].item() == 1
+        gt_involvement = data["involvement"][0].item()
+        
+        # Get model prediction (heatmap-based)
+        model_pred = None
+        if "average_needle_heatmap_value" in data:
+            model_pred = float(data["average_needle_heatmap_value"][0].item())
+        elif "cancer_logits" in data:
+            # Fallback: compute from logits if average not available
+            import torch.nn.functional as F
+            logits = data["cancer_logits"]
+            if "needle_mask" in data:
+                needle_mask = data["needle_mask"] > 0.5
+                if needle_mask.any():
+                    model_pred = float(logits[needle_mask].sigmoid().mean().item())
+        
+        # Add clear text boxes showing the 4 key pieces of information with explanations
+        if model_pred is not None:
+            info_text = (
+                f"1. GT Label: {'Cancer' if gt_label else 'Benign'}\n"
+                f"   (Ground truth: does this core have cancer?)\n"
+                f"\n"
+                f"2. GT Involvement: {gt_involvement:.2%}\n"
+                f"   (What % of needle area is cancerous?)\n"
+                f"\n"
+                f"3. Model Prediction: {model_pred:.2%}\n"
+                f"   (Model's predicted probability of cancer)"
+            )
+        else:
+            info_text = (
+                f"1. GT Label: {'Cancer' if gt_label else 'Benign'}\n"
+                f"   (Ground truth: does this core have cancer?)\n"
+                f"\n"
+                f"2. GT Involvement: {gt_involvement:.2%}\n"
+                f"   (What % of needle area is cancerous?)\n"
+                f"\n"
+                f"3. Model Prediction: N/A"
+            )
+        
+        # Add text box to both subplots for visibility
+        for ax_idx in [0, 1]:
+            ax[ax_idx].text(
+                0.02, 0.98, info_text,
+                transform=ax[ax_idx].transAxes,
+                fontsize=9,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black', linewidth=1.5),
+                family='monospace'
+            )
+            # Add axis labels with explanations
+            if ax_idx == 0:
+                ax[ax_idx].set_title('B-mode Image (Original Ultrasound)', fontsize=12, fontweight='bold', pad=10)
+            else:
+                ax[ax_idx].set_title('Model Heatmap (Predicted Cancer Probability)', fontsize=12, fontweight='bold', pad=10)
         
         # Overlay attention points and their probabilities if RL model
         if is_rl_model and 'rl_attention_coords' in data:
             coords = data['rl_attention_coords'][0].cpu().numpy()  # (k, 2) in [x, y]
             
-            # Default: just plot coordinates
-            xs = coords[:, 0]
-            ys = coords[:, 1]
-            plt.scatter(xs, ys, c='red', marker='x',
-                        s=200, linewidths=3, label='RL Attention')
+            # CRITICAL FIX: Scale coordinates from model space to display space
+            # The RL model outputs coordinates in [0, image_size] where image_size is the model's image_size parameter
+            # But show_heatmap_prediction resizes images to 224x224 for display
+            # Try to get image_size from the model's policy, fallback to 256 if not available
+            try:
+                if hasattr(base_model, 'policy') and hasattr(base_model.policy, 'image_size'):
+                    model_image_size = base_model.policy.image_size
+                else:
+                    model_image_size = 256  # Default fallback
+            except:
+                model_image_size = 256  # Default fallback
+            
+            display_size = 224  # This matches the resize in show_heatmap_prediction (line 52-54 in evaluator.py)
+            scale_factor = display_size / model_image_size
+            
+            # NOTE: For Gaussian policy in deterministic mode, the model uses the mean directly (see rl_attention_policy.py:698-699).
+            # The mean is predicted in normalized [0, 1] space, then multiplied by image_size to get [0, image_size].
+            # This interpretation is correct - we're using the mean of the Gaussian distribution as the point location.
+            
+            # Scale coordinates to display space
+            coords_display = coords * scale_factor
+            xs = coords_display[:, 0]
+            ys = coords_display[:, 1]
+            
+            # Plot attention points on both axes: B-mode image (ax[0]) and heatmap (ax[1])
+            # These are the points the RL model selected to focus on
+            for ax_idx in [0, 1]:
+                ax[ax_idx].scatter(xs, ys, c='red', marker='x',
+                            s=200, linewidths=3, 
+                            label=f'4. RL Attention Points ({len(xs)} points)\n   (Where the model looked)' if ax_idx == 0 else None,
+                            zorder=10, edgecolors='yellow')  # Yellow outline for visibility
+            
+            # Add legend showing attention points
+            if len(ax) > 0:
+                ax[0].legend(loc='lower right', fontsize=8, framealpha=0.9, title='Model Focus')
             
             point_probs = None
 
@@ -249,43 +336,45 @@ def main(args):
                     )
                 H, W = attn_map.shape
 
-                # RL coords are in image space [0, image_size]; map to attn_map indices
-                # We assume square image_size equal to max(H, W)
-                image_size = max(H, W)
-                scale_y = H / image_size
-                scale_x = W / image_size
+                # RL coords are in model image space [0, image_size]; map to attn_map indices
+                # The attention map is at feature resolution, not image resolution
+                # We need to map from model image space [0, 256] to attention map space [0, H/W]
+                feature_scale_y = H / model_image_size
+                feature_scale_x = W / model_image_size
 
                 point_probs = []
-                for x, y in coords:
-                    ix = int(np.clip(x * scale_x, 0, W - 1))
-                    iy = int(np.clip(y * scale_y, 0, H - 1))
+                for i, (x, y) in enumerate(coords):  # Use original coords in model space for attention map lookup
+                    ix = int(np.clip(x * feature_scale_x, 0, W - 1))
+                    iy = int(np.clip(y * feature_scale_y, 0, H - 1))
                     p = float(attn_map[iy, ix])
                     point_probs.append(p)
-                    plt.text(
-                        x + 2, y + 2,
-                        f"{p:.2f}",
-                        color="yellow",
-                        fontsize=8,
-                        ha="left",
-                        va="bottom",
-                        bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5),
-                    )
+                    
+                    # Annotate on both axes with scaled coordinates
+                    for ax_idx in [0, 1]:
+                        ax[ax_idx].text(
+                            xs[i] + 2, ys[i] + 2,
+                            f"{p:.2f}",
+                            color="yellow",
+                            fontsize=8,
+                            ha="left",
+                            va="bottom",
+                            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5),
+                            zorder=11,
+                        )
 
             # Save probabilities for this core into a summary table (if we computed them)
             if point_probs is not None:
-                for j, (x, y, p) in enumerate(zip(xs, ys, point_probs)):
+                for j, (x, y, p) in enumerate(zip(coords[:, 0], coords[:, 1], point_probs)):
                     rl_attention_point_records.append(
                         {
                             "patient_id": patient_id,
                             "core_id": core_id,
                             "point_idx": j,
-                            "x": float(x),
-                            "y": float(y),
+                            "x": float(x),  # Save in model space [0, 256]
+                            "y": float(y),  # Save in model space [0, 256]
                             "prob": float(p),
                         }
                     )
-            
-            plt.legend()
         
         plt.savefig(
             output_file,
