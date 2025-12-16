@@ -34,6 +34,8 @@ from medAI.modeling import list_models, create_model
 from src.loss import MaskedPredictionModule
 from src.loaders import get_dataloaders
 from src.evaluator import show_heatmap_prediction
+from src.utils import render_heatmap
+import skimage
 from train_rl import ProstNFoundMeta
 from src.evaluator import CancerLogitsHeatmapsEvaluator as Evaluator
 
@@ -223,104 +225,201 @@ def main(args):
         )
         os.makedirs(os.path.dirname(output_file), exist_ok=True)
 
-        fig = show_heatmap_prediction(data)
-        ax = fig.axes  # Get the axes from the figure
+        # Get the image (after preprocessing, it's 256x256)
+        bmode = data["bmode"][0].cpu()  # (C, H, W)
+        if bmode.shape[0] == 3:  # RGB, convert to grayscale
+            bmode = bmode.mean(dim=0)
+        bmode_np = bmode.numpy()
+        img_h, img_w = bmode_np.shape  # These will be 256x256 (square after preprocessing)
+        
+        # Get ORIGINAL aspect ratio from metadata if available
+        # Original images are not square - they have different aspect ratios
+        original_aspect_ratio = None
+        if "image_height_mm" in data and "image_width_mm" in data:
+            height_mm = float(data["image_height_mm"][0].item())
+            width_mm = float(data["image_width_mm"][0].item())
+            if height_mm > 0 and width_mm > 0:
+                original_aspect_ratio = width_mm / height_mm  # width/height
+        elif "info" in data and isinstance(data["info"], dict):
+            # Try to get from info dict if available
+            info = data["info"][0] if isinstance(data["info"], list) else data["info"]
+            if isinstance(info, dict):
+                height_mm = info.get("heightMm")
+                width_mm = info.get("widthMm")
+                if height_mm is not None and width_mm is not None:
+                    height_mm = float(height_mm)
+                    width_mm = float(width_mm)
+                    if height_mm > 0 and width_mm > 0:
+                        original_aspect_ratio = width_mm / height_mm
+        
+        # Use original aspect ratio if available, otherwise use processed image ratio (1.0 for square)
+        if original_aspect_ratio is not None:
+            display_aspect_ratio = original_aspect_ratio
+        else:
+            display_aspect_ratio = img_w / img_h  # Will be 1.0 for 256x256
+        
+        # Calculate figure size preserving original aspect ratio
+        fig_height = 5
+        # Width for 2 panels side by side, preserving aspect ratio
+        fig_width = fig_height * display_aspect_ratio * 2 + 1
+        fig, ax = plt.subplots(1, 2, figsize=(fig_width, fig_height))
+        
+        # Get masks
+        prostate_mask = data["prostate_mask"][0, 0].cpu().numpy() if "prostate_mask" in data else None
+        needle_mask = data["needle_mask"][0, 0].cpu().numpy() if "needle_mask" in data else None
+        
+        # Get heatmap
+        if "cancer_probs" in data:
+            heatmap = data["cancer_probs"][0, 0].cpu().numpy()
+        elif "cancer_logits" in data:
+            heatmap = data["cancer_logits"][0, 0].sigmoid().cpu().numpy()
+        else:
+            heatmap = None
+        
+        # Left panel: B-mode image with contours (NO attention points)
+        # Use original aspect ratio for display (not the square 256x256)
+        if original_aspect_ratio is not None:
+            ax[0].imshow(bmode_np, cmap='gray', aspect=1.0/display_aspect_ratio)
+        else:
+            ax[0].imshow(bmode_np, cmap='gray', aspect='auto')
+        if prostate_mask is not None:
+            if prostate_mask.shape != bmode_np.shape:
+                prostate_mask = skimage.transform.resize(
+                    prostate_mask, bmode_np.shape, preserve_range=True, order=0
+                ).astype(bool)
+            ax[0].contour(prostate_mask, colors='white', alpha=0.7, linewidths=1.5, levels=[0.5])
+        if needle_mask is not None:
+            if needle_mask.shape != bmode_np.shape:
+                needle_mask = skimage.transform.resize(
+                    needle_mask, bmode_np.shape, preserve_range=True, order=0
+                ).astype(bool)
+            ax[0].contour(needle_mask, colors='yellow', alpha=0.7, linewidths=1.5, levels=[0.5])
+        ax[0].set_title('B-mode Image', fontsize=11, pad=5)
+        ax[0].axis('off')
+        
+        # Right panel: Heatmap only (NO B-mode background, NO attention points here yet)
+        if heatmap is not None:
+            # Resize heatmap to match display
+            if heatmap.shape != bmode_np.shape:
+                heatmap_resized = skimage.transform.resize(
+                    heatmap, bmode_np.shape, preserve_range=True, order=1, anti_aliasing=True
+                )
+            else:
+                heatmap_resized = heatmap
+            
+            # Show heatmap with colormap (no B-mode background)
+            # Use original aspect ratio for display (not the square 256x256)
+            if original_aspect_ratio is not None:
+                im = ax[1].imshow(heatmap_resized, cmap='viridis', vmin=0, vmax=1, aspect=1.0/display_aspect_ratio)
+            else:
+                im = ax[1].imshow(heatmap_resized, cmap='viridis', vmin=0, vmax=1, aspect='auto')
+            
+            # Overlay contours on heatmap
+            if needle_mask is not None:
+                if needle_mask.shape != bmode_np.shape:
+                    needle_mask_display = skimage.transform.resize(
+                        needle_mask, bmode_np.shape, preserve_range=True, order=0
+                    ).astype(bool)
+                else:
+                    needle_mask_display = needle_mask
+                ax[1].contour(needle_mask_display, colors='white', alpha=0.7, linewidths=1.5, levels=[0.5])
+            if prostate_mask is not None:
+                if prostate_mask.shape != bmode_np.shape:
+                    prostate_mask_display = skimage.transform.resize(
+                        prostate_mask, bmode_np.shape, preserve_range=True, order=0
+                    ).astype(bool)
+                else:
+                    prostate_mask_display = prostate_mask
+                ax[1].contour(prostate_mask_display, colors='cyan', alpha=0.5, linewidths=1.5, levels=[0.5])
+        else:
+            # Fallback if no heatmap
+            if original_aspect_ratio is not None:
+                ax[1].imshow(bmode_np, cmap='gray', aspect=1.0/display_aspect_ratio)
+            else:
+                ax[1].imshow(bmode_np, cmap='gray', aspect='auto')
+        ax[1].set_title('Model Heatmap', fontsize=11, pad=5)
+        ax[1].axis('off')
         
         # Extract key information for clear display
         gt_label = data["label"][0].item() == 1
         gt_involvement = data["involvement"][0].item()
         
-        # Get model prediction (heatmap-based)
-        model_pred = None
+        # Get grade group if available
+        grade_group = None
+        if "grade_group" in data:
+            grade_group = int(data["grade_group"][0].item())
+        
+        # Get classification score (from classification head)
+        cls_score = None
+        if "image_level_classification_outputs" in data and data["image_level_classification_outputs"] is not None:
+            import torch.nn.functional as F
+            cls_logits = data["image_level_classification_outputs"][0]  # (B, num_classes)
+            cls_probs = F.softmax(cls_logits, dim=1)
+            # Get probability of positive class (csPCa or cancer depending on task)
+            if cls_probs.shape[1] > 1:
+                cls_score = float(cls_probs[0, 1].item())  # Positive class probability
+            else:
+                cls_score = float(cls_probs[0, 0].item())
+        
+        # Get ROI average (heatmap view - average in needle region)
+        roi_avg = None
         if "average_needle_heatmap_value" in data:
-            model_pred = float(data["average_needle_heatmap_value"][0].item())
-        elif "cancer_logits" in data:
+            roi_avg = float(data["average_needle_heatmap_value"][0].item())
+        elif "cancer_logits" in data and "needle_mask" in data:
             # Fallback: compute from logits if average not available
             import torch.nn.functional as F
             logits = data["cancer_logits"]
-            if "needle_mask" in data:
-                needle_mask = data["needle_mask"] > 0.5
-                if needle_mask.any():
-                    model_pred = float(logits[needle_mask].sigmoid().mean().item())
+            needle_mask = data["needle_mask"] > 0.5
+            if needle_mask.any():
+                roi_avg = float(logits[needle_mask].sigmoid().mean().item())
         
-        # Add clear text boxes showing the 4 key pieces of information with explanations
-        if model_pred is not None:
-            info_text = (
-                f"1. GT Label: {'Cancer' if gt_label else 'Benign'}\n"
-                f"   (Ground truth: does this core have cancer?)\n"
-                f"\n"
-                f"2. GT Involvement: {gt_involvement:.2%}\n"
-                f"   (What % of needle area is cancerous?)\n"
-                f"\n"
-                f"3. Model Prediction: {model_pred:.2%}\n"
-                f"   (Model's predicted probability of cancer)"
-            )
-        else:
-            info_text = (
-                f"1. GT Label: {'Cancer' if gt_label else 'Benign'}\n"
-                f"   (Ground truth: does this core have cancer?)\n"
-                f"\n"
-                f"2. GT Involvement: {gt_involvement:.2%}\n"
-                f"   (What % of needle area is cancerous?)\n"
-                f"\n"
-                f"3. Model Prediction: N/A"
-            )
+        # Build title with all requested information
+        title_parts = []
+        title_parts.append(f"GT: {'Cancer' if gt_label else 'Benign'} (Inv: {gt_involvement:.1%})")
         
-        # Add text box to both subplots for visibility
-        for ax_idx in [0, 1]:
-            ax[ax_idx].text(
-                0.02, 0.98, info_text,
-                transform=ax[ax_idx].transAxes,
-                fontsize=9,
-                verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9, edgecolor='black', linewidth=1.5),
-                family='monospace'
-            )
-            # Add axis labels with explanations
-            if ax_idx == 0:
-                ax[ax_idx].set_title('B-mode Image (Original Ultrasound)', fontsize=12, fontweight='bold', pad=10)
-            else:
-                ax[ax_idx].set_title('Model Heatmap (Predicted Cancer Probability)', fontsize=12, fontweight='bold', pad=10)
+        if grade_group is not None:
+            title_parts.append(f"GG: {grade_group}")
+        
+        if cls_score is not None:
+            title_parts.append(f"Cls: {cls_score:.1%}")
+        
+        if roi_avg is not None:
+            title_parts.append(f"ROI: {roi_avg:.1%}")
+        
+        title_parts.append(f"Core: {core_id}")
+        
+        title_text = " | ".join(title_parts)
+        fig.suptitle(title_text, fontsize=10, y=0.98)
         
         # Overlay attention points and their probabilities if RL model
         if is_rl_model and 'rl_attention_coords' in data:
             coords = data['rl_attention_coords'][0].cpu().numpy()  # (k, 2) in [x, y]
             
-            # CRITICAL FIX: Scale coordinates from model space to display space
-            # The RL model outputs coordinates in [0, image_size] where image_size is the model's image_size parameter
-            # But show_heatmap_prediction resizes images to 224x224 for display
-            # Try to get image_size from the model's policy, fallback to 256 if not available
+            # Scale coordinates from model space to display pixel space
+            # Model outputs coords in [0, model_image_size], we need [0, img_w] x [0, img_h]
             try:
                 if hasattr(base_model, 'policy') and hasattr(base_model.policy, 'image_size'):
                     model_image_size = base_model.policy.image_size
                 else:
-                    model_image_size = 256  # Default fallback
+                    model_image_size = 256
             except:
-                model_image_size = 256  # Default fallback
+                model_image_size = 256
             
-            display_size = 224  # This matches the resize in show_heatmap_prediction (line 52-54 in evaluator.py)
-            scale_factor = display_size / model_image_size
+            # Scale to pixel coordinates
+            scale_x = img_w / model_image_size
+            scale_y = img_h / model_image_size
             
-            # NOTE: For Gaussian policy in deterministic mode, the model uses the mean directly (see rl_attention_policy.py:698-699).
-            # The mean is predicted in normalized [0, 1] space, then multiplied by image_size to get [0, image_size].
-            # This interpretation is correct - we're using the mean of the Gaussian distribution as the point location.
+            xs = coords[:, 0] * scale_x
+            ys = coords[:, 1] * scale_y
             
-            # Scale coordinates to display space
-            coords_display = coords * scale_factor
-            xs = coords_display[:, 0]
-            ys = coords_display[:, 1]
+            # Plot attention points ONLY on right panel (heatmap)
+            ax[1].scatter(xs, ys, c='red', marker='x',
+                        s=150, linewidths=2.5, 
+                        label=f'RL Attention ({len(xs)})',
+                        zorder=10)
             
-            # Plot attention points on both axes: B-mode image (ax[0]) and heatmap (ax[1])
-            # These are the points the RL model selected to focus on
-            for ax_idx in [0, 1]:
-                ax[ax_idx].scatter(xs, ys, c='red', marker='x',
-                            s=200, linewidths=3, 
-                            label=f'4. RL Attention Points ({len(xs)} points)\n   (Where the model looked)' if ax_idx == 0 else None,
-                            zorder=10, edgecolors='yellow')  # Yellow outline for visibility
-            
-            # Add legend showing attention points
-            if len(ax) > 0:
-                ax[0].legend(loc='lower right', fontsize=8, framealpha=0.9, title='Model Focus')
+            # Add legend to heatmap panel
+            ax[1].legend(loc='upper right', fontsize=8, framealpha=0.8)
             
             point_probs = None
 
@@ -336,31 +435,28 @@ def main(args):
                     )
                 H, W = attn_map.shape
 
-                # RL coords are in model image space [0, image_size]; map to attn_map indices
-                # The attention map is at feature resolution, not image resolution
-                # We need to map from model image space [0, 256] to attention map space [0, H/W]
+                # Map coords to attention map space
                 feature_scale_y = H / model_image_size
                 feature_scale_x = W / model_image_size
 
                 point_probs = []
-                for i, (x, y) in enumerate(coords):  # Use original coords in model space for attention map lookup
+                for i, (x, y) in enumerate(coords):  # Use original coords
                     ix = int(np.clip(x * feature_scale_x, 0, W - 1))
                     iy = int(np.clip(y * feature_scale_y, 0, H - 1))
                     p = float(attn_map[iy, ix])
                     point_probs.append(p)
                     
-                    # Annotate on both axes with scaled coordinates
-                    for ax_idx in [0, 1]:
-                        ax[ax_idx].text(
-                            xs[i] + 2, ys[i] + 2,
-                            f"{p:.2f}",
-                            color="yellow",
-                            fontsize=8,
-                            ha="left",
-                            va="bottom",
-                            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.5),
-                            zorder=11,
-                        )
+                    # Annotate with scaled pixel coordinates ONLY on right panel
+                    ax[1].text(
+                        xs[i] + img_w*0.02, ys[i] - img_h*0.02,  # Offset proportional to image size
+                        f"{p:.2f}",
+                        color="yellow",
+                        fontsize=7,
+                        ha="left",
+                        va="top",
+                        bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6),
+                        zorder=11,
+                    )
 
             # Save probabilities for this core into a summary table (if we computed them)
             if point_probs is not None:
