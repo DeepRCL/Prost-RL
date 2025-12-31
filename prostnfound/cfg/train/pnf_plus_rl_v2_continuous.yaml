@@ -1,7 +1,7 @@
 # ProstNFound-RL V2 - Continuous Patch Attention
 # Uses full attention heatmap for decoder conditioning
 
-name: "PNF-RL-V2-continuous-classification_only"
+name: "PNF-RL-V2-continuous-classification_only-GRPO-BalancedLoss"
 
 data:
  fold: 0
@@ -47,6 +47,7 @@ loss: mil_prop_bce_entropy_reg
 outside_prostate_penalty: false
 add_image_clf: true
 image_clf_mode: cspca
+image_clf_class_weight: balanced  # Automatically balance classes to handle dataset imbalance
 
 # RL configuration
 use_rl: true

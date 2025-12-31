@@ -251,12 +251,17 @@ class ImageLevelClassificationLoss(nn.Module):
         if weight == "balanced":
             # Compute balanced weights from current batch
             # weight[class] = n_samples / (n_classes * count[class])
+            # For binary classification, we always expect 2 classes
+            num_classes = logits.shape[-1]  # Get number of classes from logits
             unique_labels, counts = torch.unique(labels, return_counts=True)
             n_samples = labels.numel()
-            n_classes = len(unique_labels)
-            weight = torch.ones(n_classes, device=logits.device)
+            
+            # Initialize weights for all classes
+            weight = torch.ones(num_classes, device=logits.device)
+            
+            # Update weights for classes present in the batch
             for i, label in enumerate(unique_labels):
-                weight[label] = n_samples / (n_classes * counts[i].float())
+                weight[label] = n_samples / (num_classes * counts[i].float())
         elif weight is not None and isinstance(weight, (list, tuple)):
             weight = torch.tensor(weight, device=logits.device, dtype=logits.dtype)
         elif weight is not None:
