@@ -9,12 +9,16 @@ import os
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
+from matplotlib.patches import Circle, Rectangle
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
 from medAI.modeling.registry import create_model
 from medAI.modeling.prostnfound_rl import ProstNFoundRL
+try:
+    from medAI.modeling.prostnfound_rl_v2 import ProstNFoundRLV2
+except ImportError:
+    ProstNFoundRLV2 = None
 import sys
 sys.path.append('..')
 from src.loaders import get_dataloaders
@@ -57,15 +61,45 @@ def visualize_attention_batch(
         axes[0].set_title(f"Input Image\nLabel: {labels[i].item():.0f}")
         axes[0].axis('off')
         
-        # Image with attention points
+        # Image with attention points/patches
         axes[1].imshow(img, cmap='gray')
         coords = attention_coords[i].cpu().numpy()
-        axes[1].scatter(coords[:, 0], coords[:, 1], c='red', marker='x', s=200, linewidths=3)
-        for idx, (x, y) in enumerate(coords):
-            axes[1].add_patch(Circle((x, y), radius=10, fill=False, color='red', linewidth=2))
-            axes[1].text(x+5, y-5, f'{idx+1}', color='white', fontsize=12, fontweight='bold',
-                        bbox=dict(boxstyle='round', facecolor='red', alpha=0.7))
-        axes[1].set_title("Attention Points")
+        
+        # Check if this is patch-based (V2) by looking at attention map shape
+        is_patch_based = False
+        patch_size = 16  # Default
+        if attention_maps is not None:
+            attn_map = attention_maps[i, 0].cpu().numpy()
+            H_attn, W_attn = attn_map.shape
+            img_h, img_w = img.shape[:2]
+            # If attention map is much smaller than image, we're using patches
+            if H_attn < img_h / 2:
+                is_patch_based = True
+                patch_size_h = img_h / H_attn
+                patch_size_w = img_w / W_attn
+                patch_size = (patch_size_h + patch_size_w) / 2
+        
+        if is_patch_based:
+            # V2: Draw patch rectangles
+            from matplotlib.patches import Rectangle
+            for idx, (x, y) in enumerate(coords):
+                rect = Rectangle(
+                    (x - patch_size/2, y - patch_size/2), patch_size, patch_size,
+                    linewidth=2.5, edgecolor='red', facecolor='none', zorder=10
+                )
+                axes[1].add_patch(rect)
+                axes[1].text(x, y, f'{idx+1}', color='yellow', fontsize=11, fontweight='bold',
+                           ha='center', va='center',
+                           bbox=dict(boxstyle='circle', facecolor='red', alpha=0.7), zorder=11)
+            axes[1].set_title("Attention Patches")
+        else:
+            # V1: Plot point markers
+            axes[1].scatter(coords[:, 0], coords[:, 1], c='red', marker='x', s=200, linewidths=3)
+            for idx, (x, y) in enumerate(coords):
+                axes[1].add_patch(Circle((x, y), radius=10, fill=False, color='red', linewidth=2))
+                axes[1].text(x+5, y-5, f'{idx+1}', color='white', fontsize=12, fontweight='bold',
+                            bbox=dict(boxstyle='round', facecolor='red', alpha=0.7))
+            axes[1].set_title("Attention Points")
         axes[1].axis('off')
         
         # Attention heatmap (if available)
@@ -122,9 +156,14 @@ def main(args):
     # Create model
     print("Loading model...")
     model = create_model(cfg.model, **cfg.model_kw)
+
+    # Check for both V1 and V2 RL models
+    is_rl_model = isinstance(model, ProstNFoundRL)
+    if ProstNFoundRLV2 is not None:
+        is_rl_model = is_rl_model or isinstance(model, ProstNFoundRLV2)
     
-    if not isinstance(model, ProstNFoundRL):
-        raise ValueError("This script requires a ProstNFoundRL model")
+    if not is_rl_model:
+        raise ValueError("This script requires a ProstNFoundRL or ProstNFoundRLV2 model")
     
     model = model.to(device)
     model.eval()

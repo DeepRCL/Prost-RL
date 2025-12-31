@@ -219,9 +219,17 @@ class MaskedPredictionModule(nn.Module):
 
 
 class ImageLevelClassificationLoss(nn.Module):
-    def __init__(self, mode):
+    def __init__(self, mode, class_weight=None):
+        """
+        Args:
+            mode: "pca" or "cspca" - classification mode
+            class_weight: Optional tensor of shape (num_classes,) to weight classes.
+                         If None, computes balanced weights automatically from batch.
+                         If "balanced", computes weights as: n_samples / (n_classes * np.bincount(y))
+        """
         super().__init__()
         self.mode = mode
+        self.class_weight = class_weight
 
     def forward(self, data):
         """
@@ -238,8 +246,25 @@ class ImageLevelClassificationLoss(nn.Module):
         else:
             labels = (data["grade_group"] > 2).long().to(logits.device)
 
-        # Compute the binary cross-entropy loss
-        loss = F.cross_entropy(logits, labels)
+        # Compute class weights if needed
+        weight = self.class_weight
+        if weight == "balanced":
+            # Compute balanced weights from current batch
+            # weight[class] = n_samples / (n_classes * count[class])
+            unique_labels, counts = torch.unique(labels, return_counts=True)
+            n_samples = labels.numel()
+            n_classes = len(unique_labels)
+            weight = torch.ones(n_classes, device=logits.device)
+            for i, label in enumerate(unique_labels):
+                weight[label] = n_samples / (n_classes * counts[i].float())
+        elif weight is not None and isinstance(weight, (list, tuple)):
+            weight = torch.tensor(weight, device=logits.device, dtype=logits.dtype)
+        elif weight is not None:
+            # Assume it's already a tensor
+            weight = weight.to(logits.device)
+
+        # Compute the cross-entropy loss with optional class weights
+        loss = F.cross_entropy(logits, labels, weight=weight)
 
         return loss
 
@@ -318,7 +343,8 @@ def build_loss(args):
 
     if args.add_image_clf:
         print(f"Adding image-level classification loss: {args.add_image_clf}")
-        losses.append(ImageLevelClassificationLoss(mode=args.image_clf_mode))
+        class_weight = args.get('image_clf_class_weight', 'balanced')
+        losses.append(ImageLevelClassificationLoss(mode=args.image_clf_mode, class_weight=class_weight))
 
     if args.outside_prostate_penalty:
         print("Adding outside prostate penalty loss.")

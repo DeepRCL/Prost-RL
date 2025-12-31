@@ -32,7 +32,16 @@ from einops import rearrange, repeat
 from matplotlib import pyplot as plt
 from medAI.modeling.prostnfound import ProstNFound
 from medAI.modeling.prostnfound_rl import ProstNFoundRL
+try:
+    from medAI.modeling.prostnfound_rl_v2 import ProstNFoundRLV2
+except ImportError:
+    ProstNFoundRLV2 = None
 from medAI.modeling.grpo import GRPO, BatchedGRPOTrainer, create_grpo_optimizer
+try:
+    from medAI.modeling.grpo_v2 import GRPO_V2, BatchedGRPOTrainer as BatchedGRPOTrainerV2
+except ImportError:
+    GRPO_V2 = None
+    BatchedGRPOTrainerV2 = None
 from medAI.modeling.setr import SETR
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -118,7 +127,7 @@ def main(cfg):
     print(f"Model: {type(model)}")
     print(f"Model kwargs: {cfg.model_kw}")
     
-    is_rl_model = isinstance(model, ProstNFoundRL)
+    is_rl_model = isinstance(model, ProstNFoundRL) or (ProstNFoundRLV2 is not None and isinstance(model, ProstNFoundRLV2))
     logging.info(f"Is RL model: {is_rl_model}")
     
     model = ProstNFoundMeta(model, **cfg.get('metamodel', {}), is_rl=is_rl_model)
@@ -160,8 +169,12 @@ def main(cfg):
         # Check if using PPO mode (with value function)
         use_value_function = cfg.model_kw.get('use_value_function', False)
         
+        # Use GRPO_V2 if available, otherwise fall back to GRPO
+        GRPO_class = GRPO_V2 if GRPO_V2 is not None else GRPO
+        logging.info(f"Using {GRPO_class.__name__} for RL training")
+        
         # Create GRPO (or PPO if value function is enabled)
-        grpo = GRPO(
+        grpo = GRPO_class(
             clip_eps=cfg.get('rl_clip_eps', 0.2),
             entropy_coef=cfg.get('rl_entropy_coef', 0.01),
             kl_coef=cfg.get('rl_kl_coef', 0.01),
@@ -762,6 +775,8 @@ class ProstNFoundMeta(nn.Module):
             logging.info(f"Model ProstNFound with prompts {self.model.prompts}")
         elif isinstance(self.model, ProstNFoundRL):
             logging.info(f"Model ProstNFoundRL with prompts {self.model.prompts}")
+        elif ProstNFoundRLV2 is not None and isinstance(self.model, ProstNFoundRLV2):
+            logging.info(f"Model ProstNFoundRLV2 with prompts {self.model.prompts}")
 
         self.register_buffer("temperature", torch.tensor([1.0]))
         self.register_buffer("bias", torch.tensor([0.0]))
@@ -783,7 +798,12 @@ class ProstNFoundMeta(nn.Module):
         B = len(bmode)
 
         # Wrapped forward pass
-        if isinstance(self.model, (ProstNFound, ProstNFoundRL)):
+        is_prostnfound_model = (
+            isinstance(self.model, (ProstNFound, ProstNFoundRL)) or
+            (ProstNFoundRLV2 is not None and isinstance(self.model, ProstNFoundRLV2))
+        )
+        
+        if is_prostnfound_model:
             prompts = {}
             for prompt_name in self.model.prompts:
                 prompts[prompt_name] = data[prompt_name].to(

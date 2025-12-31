@@ -14,6 +14,7 @@ import time
 import PIL
 import hydra
 from matplotlib import pyplot as plt
+from matplotlib.patches import Rectangle
 from omegaconf import OmegaConf
 import rich_argparse
 import torch
@@ -21,6 +22,10 @@ from PIL import Image
 import medAI
 from medAI.layers.masked_prediction_module import get_bags_of_predictions
 from medAI.modeling.prostnfound_rl import ProstNFoundRL
+try:
+    from medAI.modeling.prostnfound_rl_v2 import ProstNFoundRLV2
+except ImportError:
+    ProstNFoundRLV2 = None
 from medAI.utils.accumulators import DataFrameCollector
 from medAI.utils.argparse import UpdateDictAction
 
@@ -67,7 +72,10 @@ def main(args):
     
     # Detect legacy checkpoints that don't have policy_arch_version
     # Legacy checkpoints used a simpler attention_map_head architecture
-    if 'policy_arch_version' not in model_kw:
+    # NOTE: policy_arch_version is only for V1 RL models (prostnfound_rl), NOT V2 models (prostnfound_rl_v2)
+    is_v1_model = 'rl_v2' not in args.model  # V1 models don't have 'rl_v2' in their name
+    
+    if is_v1_model and 'policy_arch_version' not in model_kw:
         # Check if this is a legacy checkpoint by inspecting the state dict
         has_legacy_arch = False
         for key in state.get("model", {}).keys():
@@ -80,11 +88,16 @@ def main(args):
                     break
         
         if has_legacy_arch:
-            print("Detected legacy architecture checkpoint (v1). Setting policy_arch_version='v1'")
+            print("Detected legacy V1 architecture checkpoint. Setting policy_arch_version='v1'")
             model_kw['policy_arch_version'] = 'v1'
         else:
-            print("Architecture version not in checkpoint. Defaulting to 'v2'")
+            print("V1 architecture version not in checkpoint. Defaulting to 'v2'")
             model_kw['policy_arch_version'] = 'v2'
+    elif not is_v1_model:
+        # V2 models don't use policy_arch_version - remove it if present
+        if 'policy_arch_version' in model_kw:
+            print("Removing policy_arch_version from V2 model kwargs (not applicable)")
+            del model_kw['policy_arch_version']
     
     # Update args with the modified model_kw (use OmegaConf.update to handle struct mode)
     OmegaConf.set_struct(args, False)  # Disable struct mode temporarily
@@ -110,7 +123,10 @@ def main(args):
 
     # Create model and detect if it's RL
     base_model = create_model(args.model, **args.model_kw)
+    # Check for both V1 (ProstNFoundRL) and V2 (ProstNFoundRLV2) models
     is_rl_model = isinstance(base_model, ProstNFoundRL)
+    if ProstNFoundRLV2 is not None:
+        is_rl_model = is_rl_model or isinstance(base_model, ProstNFoundRLV2)
     print(f"Model type: {type(base_model)}")
     print(f"Is RL model: {is_rl_model}")
     
@@ -148,6 +164,8 @@ def main(args):
         rl_accumulator = defaultdict(list)
         # For analysis: store per-core RL attention probabilities and coordinates
         rl_attention_point_records = []
+        # Track high prediction cases (for verification that model predicts cancer)
+        high_prediction_cases = []
 
     loader = loaders[args.split]
 
@@ -177,16 +195,17 @@ def main(args):
         if args.postprocess:
             cancer_logits = data.pop("cancer_logits")
             heatmap = cancer_logits[0, 0].sigmoid().cpu().numpy()
-            heatmap = (heatmap * 255).astype(np.uint8)
             # blur and upsample
             
             import skimage
 
+            # Apply Gaussian blur (operates on float values in [0, 1])
             blurred = skimage.filters.gaussian(heatmap, sigma=1.5)
+            # Resize (returns values in [0, 1] range)
             upsampled = skimage.transform.resize(blurred, (256, 256), order=1, anti_aliasing=True)
-            upsampled = (upsampled * 255).astype(np.uint8)
+            # Keep as float in [0, 1] range
             heatmap = upsampled
-            data["cancer_probs"] = (torch.tensor(heatmap) / 255.0)[None, None, ...]
+            data["cancer_probs"] = torch.tensor(heatmap)[None, None, ...]
         else:
             # get raw heatmap and also save as png
             heatmap = data["cancer_logits"][0, 0].sigmoid().cpu().numpy()
@@ -199,8 +218,11 @@ def main(args):
         accumulator["infer_time"].append(infer_time)
         
         # Store RL-specific information
-        if is_rl_model and 'rl_attention_coords' in data:
-            rl_accumulator['attention_coords'].append(data['rl_attention_coords'].cpu())
+        if is_rl_model:
+            # For discrete mode: store attention coordinates
+            if 'rl_attention_coords' in data and data['rl_attention_coords'] is not None:
+                rl_accumulator['attention_coords'].append(data['rl_attention_coords'].cpu())
+            # For both discrete and continuous: store attention maps
             if 'rl_attention_map' in data and data['rl_attention_map'] is not None:
                 rl_accumulator['attention_maps'].append(data['rl_attention_map'].cpu())
 
@@ -258,11 +280,22 @@ def main(args):
         else:
             display_aspect_ratio = img_w / img_h  # Will be 1.0 for 256x256
         
+        # Detect if we need 3-panel layout (for continuous V2 models)
+        is_v2_model = False
+        is_continuous_v2 = False
+        try:
+            if hasattr(base_model, 'discrete_attention'):
+                is_v2_model = True
+                is_continuous_v2 = not base_model.discrete_attention
+        except:
+            pass
+        
         # Calculate figure size preserving original aspect ratio
         fig_height = 5
-        # Width for 2 panels side by side, preserving aspect ratio
-        fig_width = fig_height * display_aspect_ratio * 2 + 1
-        fig, ax = plt.subplots(1, 2, figsize=(fig_width, fig_height))
+        # Width for panels side by side, preserving aspect ratio
+        num_panels = 3 if (is_rl_model and is_continuous_v2) else 2
+        fig_width = fig_height * display_aspect_ratio * num_panels + 1
+        fig, ax = plt.subplots(1, num_panels, figsize=(fig_width, fig_height))
         
         # Get masks
         prostate_mask = data["prostate_mask"][0, 0].cpu().numpy() if "prostate_mask" in data else None
@@ -276,7 +309,7 @@ def main(args):
         else:
             heatmap = None
         
-        # Left panel: B-mode image with contours (NO attention points)
+        # Panel 0: B-mode image with contours
         # Use original aspect ratio for display (not the square 256x256)
         if original_aspect_ratio is not None:
             ax[0].imshow(bmode_np, cmap='gray', aspect=1.0/display_aspect_ratio)
@@ -297,48 +330,103 @@ def main(args):
         ax[0].set_title('B-mode Image', fontsize=11, pad=5)
         ax[0].axis('off')
         
-        # Right panel: Heatmap only (NO B-mode background, NO attention points here yet)
-        if heatmap is not None:
-            # Resize heatmap to match display
-            if heatmap.shape != bmode_np.shape:
-                heatmap_resized = skimage.transform.resize(
-                    heatmap, bmode_np.shape, preserve_range=True, order=1, anti_aliasing=True
-                )
-            else:
-                heatmap_resized = heatmap
-            
-            # Show heatmap with colormap (no B-mode background)
-            # Use original aspect ratio for display (not the square 256x256)
-            if original_aspect_ratio is not None:
-                im = ax[1].imshow(heatmap_resized, cmap='viridis', vmin=0, vmax=1, aspect=1.0/display_aspect_ratio)
-            else:
-                im = ax[1].imshow(heatmap_resized, cmap='viridis', vmin=0, vmax=1, aspect='auto')
-            
-            # Overlay contours on heatmap
-            if needle_mask is not None:
-                if needle_mask.shape != bmode_np.shape:
-                    needle_mask_display = skimage.transform.resize(
-                        needle_mask, bmode_np.shape, preserve_range=True, order=0
-                    ).astype(bool)
+        # Panel 1 (middle): RL Attention Map OR Decoder Heatmap (depending on model type)
+        # For continuous V2: Show RL attention, For others: Show decoder heatmap
+        if is_rl_model and is_continuous_v2:
+            # Middle panel: RL Attention Map
+            if 'rl_attention_map' in data and data['rl_attention_map'] is not None:
+                attn_map = data['rl_attention_map'][0].detach().cpu().numpy()
+                attn_map = np.squeeze(attn_map)
+                if attn_map.ndim == 2:
+                    # Resize to image size
+                    attn_map_resized = skimage.transform.resize(
+                        attn_map, (img_h, img_w), order=1, preserve_range=True
+                    )
+                    # Normalize to [0, 1]
+                    attn_map_resized = (attn_map_resized - attn_map_resized.min()) / (attn_map_resized.max() - attn_map_resized.min() + 1e-8)
+                    
+                    if original_aspect_ratio is not None:
+                        im = ax[1].imshow(attn_map_resized, cmap='Reds', vmin=0, vmax=1, aspect=1.0/display_aspect_ratio)
+                    else:
+                        im = ax[1].imshow(attn_map_resized, cmap='Reds', vmin=0, vmax=1, aspect='auto')
+                    
+                    # Overlay contours
+                    if needle_mask is not None:
+                        if needle_mask.shape != bmode_np.shape:
+                            needle_mask_display = skimage.transform.resize(
+                                needle_mask, bmode_np.shape, preserve_range=True, order=0
+                            ).astype(bool)
+                        else:
+                            needle_mask_display = needle_mask
+                        ax[1].contour(needle_mask_display, colors='white', alpha=0.7, linewidths=1.5, levels=[0.5])
+                    if prostate_mask is not None:
+                        if prostate_mask.shape != bmode_np.shape:
+                            prostate_mask_display = skimage.transform.resize(
+                                prostate_mask, bmode_np.shape, preserve_range=True, order=0
+                            ).astype(bool)
+                        else:
+                            prostate_mask_display = prostate_mask
+                        ax[1].contour(prostate_mask_display, colors='cyan', alpha=0.5, linewidths=1.5, levels=[0.5])
+                    
+                    plt.colorbar(im, ax=ax[1], fraction=0.046, pad=0.04)
+                    ax[1].set_title('RL Attention Map', fontsize=11, pad=5)
                 else:
-                    needle_mask_display = needle_mask
-                ax[1].contour(needle_mask_display, colors='white', alpha=0.7, linewidths=1.5, levels=[0.5])
-            if prostate_mask is not None:
-                if prostate_mask.shape != bmode_np.shape:
-                    prostate_mask_display = skimage.transform.resize(
-                        prostate_mask, bmode_np.shape, preserve_range=True, order=0
-                    ).astype(bool)
+                    # Fallback
+                    if original_aspect_ratio is not None:
+                        ax[1].imshow(bmode_np, cmap='gray', aspect=1.0/display_aspect_ratio)
+                    else:
+                        ax[1].imshow(bmode_np, cmap='gray', aspect='auto')
+                    ax[1].set_title('RL Attention (N/A)', fontsize=11, pad=5)
+            else:
+                # Fallback
+                if original_aspect_ratio is not None:
+                    ax[1].imshow(bmode_np, cmap='gray', aspect=1.0/display_aspect_ratio)
                 else:
-                    prostate_mask_display = prostate_mask
-                ax[1].contour(prostate_mask_display, colors='cyan', alpha=0.5, linewidths=1.5, levels=[0.5])
+                    ax[1].imshow(bmode_np, cmap='gray', aspect='auto')
+                ax[1].set_title('RL Attention (N/A)', fontsize=11, pad=5)
+            ax[1].axis('off')
         else:
-            # Fallback if no heatmap
-            if original_aspect_ratio is not None:
-                ax[1].imshow(bmode_np, cmap='gray', aspect=1.0/display_aspect_ratio)
+            # For non-continuous or non-RL: Show decoder heatmap in panel 1
+            if heatmap is not None:
+                # Resize heatmap to match display
+                if heatmap.shape != bmode_np.shape:
+                    heatmap_resized = skimage.transform.resize(
+                        heatmap, bmode_np.shape, preserve_range=True, order=1, anti_aliasing=True
+                    )
+                else:
+                    heatmap_resized = heatmap
+                
+                # Show heatmap with colormap
+                if original_aspect_ratio is not None:
+                    im = ax[1].imshow(heatmap_resized, cmap='viridis', vmin=0, vmax=1, aspect=1.0/display_aspect_ratio)
+                else:
+                    im = ax[1].imshow(heatmap_resized, cmap='viridis', vmin=0, vmax=1, aspect='auto')
+                
+                # Overlay contours on heatmap
+                if needle_mask is not None:
+                    if needle_mask.shape != bmode_np.shape:
+                        needle_mask_display = skimage.transform.resize(
+                            needle_mask, bmode_np.shape, preserve_range=True, order=0
+                        ).astype(bool)
+                    else:
+                        needle_mask_display = needle_mask
+                    ax[1].contour(needle_mask_display, colors='white', alpha=0.7, linewidths=1.5, levels=[0.5])
+                if prostate_mask is not None:
+                    if prostate_mask.shape != bmode_np.shape:
+                        prostate_mask_display = skimage.transform.resize(
+                            prostate_mask, bmode_np.shape, preserve_range=True, order=0
+                        ).astype(bool)
+                    else:
+                        prostate_mask_display = prostate_mask
+                    ax[1].contour(prostate_mask_display, colors='cyan', alpha=0.5, linewidths=1.5, levels=[0.5])
             else:
-                ax[1].imshow(bmode_np, cmap='gray', aspect='auto')
-        ax[1].set_title('Model Heatmap', fontsize=11, pad=5)
-        ax[1].axis('off')
+                # Fallback if no heatmap
+                if original_aspect_ratio is not None:
+                    ax[1].imshow(bmode_np, cmap='gray', aspect=1.0/display_aspect_ratio)
+                else:
+                    ax[1].imshow(bmode_np, cmap='gray', aspect='auto')
+            ax[1].set_title('Decoder Heatmap', fontsize=11, pad=5)
+            ax[1].axis('off')
         
         # Extract key information for clear display
         gt_label = data["label"][0].item() == 1
@@ -391,98 +479,238 @@ def main(args):
         title_text = " | ".join(title_parts)
         fig.suptitle(title_text, fontsize=10, y=0.98)
         
-        # Overlay attention points and their probabilities if RL model
-        if is_rl_model and 'rl_attention_coords' in data:
-            coords = data['rl_attention_coords'][0].cpu().numpy()  # (k, 2) in [x, y]
-            
-            # Scale coordinates from model space to display pixel space
-            # Model outputs coords in [0, model_image_size], we need [0, img_w] x [0, img_h]
-            try:
-                if hasattr(base_model, 'policy') and hasattr(base_model.policy, 'image_size'):
-                    model_image_size = base_model.policy.image_size
+        # Panel 2 (right): Decoder Output Heatmap (for continuous V2)
+        # For continuous V2, this is the rightmost panel showing final decoder predictions
+        # For other models, overlay attention points on the heatmap panel
+        if is_rl_model and is_continuous_v2:
+            # Right panel: Decoder output heatmap
+            if heatmap is not None:
+                # Resize heatmap to match display
+                if heatmap.shape != bmode_np.shape:
+                    heatmap_resized = skimage.transform.resize(
+                        heatmap, bmode_np.shape, preserve_range=True, order=1, anti_aliasing=True
+                    )
                 else:
-                    model_image_size = 256
-            except:
-                model_image_size = 256
-            
-            # Scale to pixel coordinates
-            scale_x = img_w / model_image_size
-            scale_y = img_h / model_image_size
-            
-            xs = coords[:, 0] * scale_x
-            ys = coords[:, 1] * scale_y
-            
-            # Plot attention points ONLY on right panel (heatmap)
-            ax[1].scatter(xs, ys, c='red', marker='x',
-                        s=150, linewidths=2.5, 
-                        label=f'RL Attention ({len(xs)})',
-                        zorder=10)
-            
-            # Add legend to heatmap panel
-            ax[1].legend(loc='upper right', fontsize=8, framealpha=0.8)
-            
-            point_probs = None
-
-            # If attention map is available, annotate probabilities from it
-            if 'rl_attention_map' in data and data['rl_attention_map'] is not None:
-                # rl_attention_map: typically (B, 1, H, W) or (B, H, W)
-                attn_map = data['rl_attention_map'][0].detach().cpu().numpy()
-                # Squeeze any singleton channel dimension
-                attn_map = np.squeeze(attn_map)
-                if attn_map.ndim != 2:
-                    raise ValueError(
-                        f"Expected attention map to be 2D after squeeze, got shape {attn_map.shape}"
-                    )
-                H, W = attn_map.shape
-
-                # Map coords to attention map space
-                feature_scale_y = H / model_image_size
-                feature_scale_x = W / model_image_size
-
-                point_probs = []
-                for i, (x, y) in enumerate(coords):  # Use original coords
-                    ix = int(np.clip(x * feature_scale_x, 0, W - 1))
-                    iy = int(np.clip(y * feature_scale_y, 0, H - 1))
-                    p = float(attn_map[iy, ix])
-                    point_probs.append(p)
-                    
-                    # Annotate with scaled pixel coordinates ONLY on right panel
-                    ax[1].text(
-                        xs[i] + img_w*0.02, ys[i] - img_h*0.02,  # Offset proportional to image size
-                        f"{p:.2f}",
-                        color="yellow",
-                        fontsize=7,
-                        ha="left",
-                        va="top",
-                        bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6),
-                        zorder=11,
-                    )
-
-            # Save probabilities for this core into a summary table (if we computed them)
-            if point_probs is not None:
-                for j, (x, y, p) in enumerate(zip(coords[:, 0], coords[:, 1], point_probs)):
-                    rl_attention_point_records.append(
-                        {
-                            "patient_id": patient_id,
-                            "core_id": core_id,
-                            "point_idx": j,
-                            "x": float(x),  # Save in model space [0, 256]
-                            "y": float(y),  # Save in model space [0, 256]
-                            "prob": float(p),
-                        }
-                    )
+                    heatmap_resized = heatmap
+                
+                # Show heatmap with colormap
+                if original_aspect_ratio is not None:
+                    im = ax[2].imshow(heatmap_resized, cmap='viridis', vmin=0, vmax=1, aspect=1.0/display_aspect_ratio)
+                else:
+                    im = ax[2].imshow(heatmap_resized, cmap='viridis', vmin=0, vmax=1, aspect='auto')
+                
+                # Overlay contours
+                if needle_mask is not None:
+                    if needle_mask.shape != bmode_np.shape:
+                        needle_mask_display = skimage.transform.resize(
+                            needle_mask, bmode_np.shape, preserve_range=True, order=0
+                        ).astype(bool)
+                    else:
+                        needle_mask_display = needle_mask
+                    ax[2].contour(needle_mask_display, colors='white', alpha=0.7, linewidths=1.5, levels=[0.5])
+                if prostate_mask is not None:
+                    if prostate_mask.shape != bmode_np.shape:
+                        prostate_mask_display = skimage.transform.resize(
+                            prostate_mask, bmode_np.shape, preserve_range=True, order=0
+                        ).astype(bool)
+                    else:
+                        prostate_mask_display = prostate_mask
+                    ax[2].contour(prostate_mask_display, colors='cyan', alpha=0.5, linewidths=1.5, levels=[0.5])
+                
+                plt.colorbar(im, ax=ax[2], fraction=0.046, pad=0.04)
+            else:
+                # Fallback
+                if original_aspect_ratio is not None:
+                    ax[2].imshow(bmode_np, cmap='gray', aspect=1.0/display_aspect_ratio)
+                else:
+                    ax[2].imshow(bmode_np, cmap='gray', aspect='auto')
+            ax[2].set_title('Decoder Output', fontsize=11, pad=5)
+            ax[2].axis('off')
         
+        # Overlay attention points/patches if RL model (for discrete modes)
+        if is_rl_model:
+            # Detect if V2 model (patch-based)
+            is_discrete_v2 = False
+            try:
+                if hasattr(base_model, 'discrete_attention'):
+                    is_discrete_v2 = base_model.discrete_attention
+                elif 'rl_action_indices' in data:
+                    is_discrete_v2 = True
+            except:
+                pass
+            
+            # For discrete modes, overlay attention points/patches on the heatmap panel
+            if 'rl_attention_coords' in data and data['rl_attention_coords'] is not None:
+                coords = data['rl_attention_coords'][0].cpu().numpy()  # (k, 2) in [x, y]
+                
+                # Scale coordinates from model space to display pixel space
+                try:
+                    if hasattr(base_model, 'policy') and hasattr(base_model.policy, 'image_size'):
+                        model_image_size = base_model.policy.image_size
+                    else:
+                        model_image_size = 256
+                except:
+                    model_image_size = 256
+                
+                # Scale to pixel coordinates
+                scale_x = img_w / model_image_size
+                scale_y = img_h / model_image_size
+                
+                xs = coords[:, 0] * scale_x
+                ys = coords[:, 1] * scale_y
+                
+                # Determine which panel to annotate (panel 1 for 2-panel, panel 2 for 3-panel)
+                annot_panel_idx = 2 if (is_continuous_v2 and num_panels == 3) else 1
+                
+                if is_discrete_v2:
+                    # V2 Discrete: Draw patch rectangles
+                    # Get patch size from attention map if available
+                    patch_size = 16  # Default patch size in pixels
+                    if 'rl_attention_map' in data and data['rl_attention_map'] is not None:
+                        attn_map = data['rl_attention_map'][0].detach().cpu().numpy()
+                        attn_map = np.squeeze(attn_map)
+                        if attn_map.ndim == 2:
+                            H_patches, W_patches = attn_map.shape
+                            patch_size_y = img_h / H_patches
+                            patch_size_x = img_w / W_patches
+                            patch_size = (patch_size_x + patch_size_y) / 2
+                    
+                    # Draw rectangles for selected patches
+                    for i, (x, y) in enumerate(zip(xs, ys)):
+                        # Center the rectangle on the point
+                        rect_x = x - patch_size / 2
+                        rect_y = y - patch_size / 2
+                        rect = Rectangle(
+                            (rect_x, rect_y), patch_size, patch_size,
+                            linewidth=2.5, edgecolor='red', facecolor='none',
+                            linestyle='-', zorder=10
+                        )
+                        ax[annot_panel_idx].add_patch(rect)
+                        # Add patch number
+                        ax[annot_panel_idx].text(x, y, f'{i+1}', color='yellow', fontsize=9,
+                                 ha='center', va='center', fontweight='bold',
+                                 bbox=dict(boxstyle='circle', facecolor='red', alpha=0.7),
+                                 zorder=11)
+                    
+                    ax[annot_panel_idx].legend([f'RL Patches ({len(xs)})'], loc='upper right', fontsize=8, framealpha=0.8)
+                else:
+                    # V1: Plot attention points
+                    ax[annot_panel_idx].scatter(xs, ys, c='red', marker='x',
+                                s=150, linewidths=2.5, 
+                                label=f'RL Attention ({len(xs)})',
+                                zorder=10)
+                    
+                    # Add legend to heatmap panel
+                    ax[annot_panel_idx].legend(loc='upper right', fontsize=8, framealpha=0.8)
+                
+                point_probs = None
+
+                # If attention map is available, annotate probabilities from it (only for discrete modes with coords)
+                if 'rl_attention_map' in data and data['rl_attention_map'] is not None:
+                    # rl_attention_map: typically (B, 1, H, W) or (B, H, W)
+                    attn_map = data['rl_attention_map'][0].detach().cpu().numpy()
+                    # Squeeze any singleton channel dimension
+                    attn_map = np.squeeze(attn_map)
+                    if attn_map.ndim != 2:
+                        raise ValueError(
+                            f"Expected attention map to be 2D after squeeze, got shape {attn_map.shape}"
+                        )
+                    H, W = attn_map.shape
+
+                    # Map coords to attention map space
+                    feature_scale_y = H / model_image_size
+                    feature_scale_x = W / model_image_size
+
+                    point_probs = []
+                    for i, (x, y) in enumerate(coords):  # Use original coords
+                        ix = int(np.clip(x * feature_scale_x, 0, W - 1))
+                        iy = int(np.clip(y * feature_scale_y, 0, H - 1))
+                        p = float(attn_map[iy, ix])
+                        point_probs.append(p)
+                        
+                        # Annotate with scaled pixel coordinates on annotation panel
+                        ax[annot_panel_idx].text(
+                            xs[i] + img_w*0.02, ys[i] - img_h*0.02,  # Offset proportional to image size
+                            f"{p:.2f}",
+                            color="yellow",
+                            fontsize=7,
+                            ha="left",
+                            va="top",
+                            bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.6),
+                            zorder=11,
+                        )
+
+                # Save probabilities for this core into a summary table (if we computed them)
+                if point_probs is not None:
+                    for j, (x, y, p) in enumerate(zip(coords[:, 0], coords[:, 1], point_probs)):
+                        rl_attention_point_records.append(
+                            {
+                                "patient_id": patient_id,
+                                "core_id": core_id,
+                                "point_idx": j,
+                                "x": float(x),  # Save in model space [0, 256]
+                                "y": float(y),  # Save in model space [0, 256]
+                                "prob": float(p),
+                            }
+                        )
+        
+        plt.tight_layout()
         plt.savefig(
             output_file,
             format=args.save_format,
+            bbox_inches='tight',
+            dpi=150
         )
         plt.close()
+        
+        # Track high prediction cases for logging
+        if cls_score is not None and cls_score > 0.4:
+            high_prediction_cases.append({
+                'core_id': core_id,
+                'patient_id': patient_id,
+                'cls_score': cls_score,
+                'roi_avg': roi_avg if roi_avg is not None else 'N/A',
+                'gt_label': 'Cancer' if gt_label else 'Benign',
+                'gt_involvement': gt_involvement,
+                'type': 'CLS'
+            })
+        elif roi_avg is not None and roi_avg > 0.4:
+            high_prediction_cases.append({
+                'core_id': core_id,
+                'patient_id': patient_id,
+                'cls_score': cls_score if cls_score is not None else 'N/A',
+                'roi_avg': roi_avg,
+                'gt_label': 'Cancer' if gt_label else 'Benign',
+                'gt_involvement': gt_involvement,
+                'type': 'ROI'
+            })
         
         # Accumulate metrics for this batch
         evaluator(data)
 
     table = evaluator.accumulator.compute()
     table.to_csv(os.path.join(args.output_dir, "metrics_by_core.csv"))
+    
+    # Log high prediction cases
+    if is_rl_model and len(high_prediction_cases) > 0:
+        print(f"\n=== High Prediction Cases (CLS or ROI > 40%) ===")
+        print(f"Found {len(high_prediction_cases)} cases with high predictions:")
+        for case in high_prediction_cases[:20]:  # Show first 20
+            cls_str = f"{case['cls_score']:.1%}" if isinstance(case['cls_score'], float) else str(case['cls_score'])
+            roi_str = f"{case['roi_avg']:.1%}" if isinstance(case['roi_avg'], float) else str(case['roi_avg'])
+            print(f"  {case['patient_id']}/{case['core_id']}: "
+                  f"CLS={cls_str}, ROI={roi_str}, "
+                  f"GT={case['gt_label']} (Inv: {case['gt_involvement']:.1%})")
+        if len(high_prediction_cases) > 20:
+            print(f"  ... and {len(high_prediction_cases) - 20} more")
+        
+        # Save to CSV
+        import pandas as pd
+        df_high_preds = pd.DataFrame(high_prediction_cases)
+        df_high_preds.to_csv(
+            os.path.join(args.output_dir, "high_prediction_cases.csv"), index=False
+        )
+        print(f"\nSaved high prediction cases to: {os.path.join(args.output_dir, 'high_prediction_cases.csv')}")
 
     metrics = evaluator.aggregate_metrics()
     metrics["infer_time"] = np.array(accumulator["infer_time"]).mean()
@@ -491,20 +719,27 @@ def main(args):
     # Add RL-specific metrics
     if is_rl_model and rl_accumulator:
         print("\n=== RL Attention Statistics ===")
-        all_coords = torch.cat(rl_accumulator['attention_coords'], dim=0)  # (N, k, 2)
-        metrics['rl_attention_mean_x'] = float(all_coords[:, :, 0].mean())
-        metrics['rl_attention_mean_y'] = float(all_coords[:, :, 1].mean())
-        metrics['rl_attention_std_x'] = float(all_coords[:, :, 0].std())
-        metrics['rl_attention_std_y'] = float(all_coords[:, :, 1].std())
-        
-        print(f"Average attention X: {metrics['rl_attention_mean_x']:.2f} ± {metrics['rl_attention_std_x']:.2f}")
-        print(f"Average attention Y: {metrics['rl_attention_mean_y']:.2f} ± {metrics['rl_attention_std_y']:.2f}")
-        
-        # Save attention coordinates for further analysis
-        np.save(
-            os.path.join(args.output_dir, "rl_attention_coords.npy"),
-            all_coords.numpy()
-        )
+        # Only compute coordinate statistics if we have coordinates (discrete mode)
+        if len(rl_accumulator['attention_coords']) > 0:
+            all_coords = torch.cat(rl_accumulator['attention_coords'], dim=0)  # (N, k, 2)
+            metrics['rl_attention_mean_x'] = float(all_coords[:, :, 0].mean())
+            metrics['rl_attention_mean_y'] = float(all_coords[:, :, 1].mean())
+            metrics['rl_attention_std_x'] = float(all_coords[:, :, 0].std())
+            metrics['rl_attention_std_y'] = float(all_coords[:, :, 1].std())
+            
+            print(f"Average attention X: {metrics['rl_attention_mean_x']:.2f} ± {metrics['rl_attention_std_x']:.2f}")
+            print(f"Average attention Y: {metrics['rl_attention_mean_y']:.2f} ± {metrics['rl_attention_std_y']:.2f}")
+            
+            # Save attention coordinates for further analysis
+            np.save(
+                os.path.join(args.output_dir, "rl_attention_coords.npy"),
+                all_coords.numpy()
+            )
+        else:
+            print("No attention coordinates available (continuous mode)")
+            # For continuous mode, we still have attention maps
+            if len(rl_accumulator['attention_maps']) > 0:
+                print(f"Collected {len(rl_accumulator['attention_maps'])} attention maps")
 
         # Optionally save per-point attention probabilities and coordinates as CSV
         if 'rl_attention_point_records' in locals() and len(rl_attention_point_records) > 0:
