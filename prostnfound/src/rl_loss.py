@@ -39,6 +39,7 @@ class RLRewardComputer:
         heatmap_reward_weight: Weight for heatmap/ROI performance (default: 0.5)
         classification_reward_weight: Weight for classification performance (default: 0.5)
         diversity_reward_weight: Weight for within-image diversity bonus (default: 0.0)
+        benign_sparsity_penalty_weight: Weight for penalizing high attention in benign cases (default: 0.0)
     """
     
     def __init__(
@@ -51,6 +52,7 @@ class RLRewardComputer:
         heatmap_reward_weight: float = 0.5,
         classification_reward_weight: float = 0.5,
         diversity_reward_weight: float = 0.0,  # Diversity bonus (prevents policy collapse)
+        benign_sparsity_penalty_weight: float = 0.0,  # Penalize high attention in benign cases
     ):
         self.reward_mode = reward_mode
         self.cspca_bonus = cspca_bonus
@@ -60,6 +62,7 @@ class RLRewardComputer:
         self.heatmap_reward_weight = heatmap_reward_weight
         self.classification_reward_weight = classification_reward_weight
         self.diversity_reward_weight = diversity_reward_weight
+        self.benign_sparsity_penalty_weight = benign_sparsity_penalty_weight
     
     def compute_roi_involvement_reward(
         self,
@@ -331,6 +334,86 @@ class RLRewardComputer:
         
         return torch.stack(diversity_rewards).to(device)
     
+    def compute_benign_sparsity_penalty(
+        self,
+        rl_attention_map: torch.Tensor,
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute penalty for high attention activation in benign cases.
+        
+        For benign samples (involvement = 0), we want the RL agent to produce
+        sparse/low attention activations. This penalty encourages the model to
+        only activate strongly when there's actually cancer present.
+        
+        The penalty is the mean attention value for benign samples, scaled by
+        the penalty weight. For cancer samples, the penalty is 0.
+        
+        Args:
+            rl_attention_map: Attention map from RL policy (B, H, W) or (B, 1, H, W)
+            data: Batch data containing involvement labels
+            
+        Returns:
+            penalties: Sparsity penalty for each sample (B,), 0 for cancer cases
+        """
+        B = rl_attention_map.shape[0]
+        device = rl_attention_map.device
+        
+        # Get involvement (0 = benign, >0 = cancer)
+        involvement = data['involvement'].to(device).float()
+        if involvement.ndim > 1:
+            involvement = involvement.squeeze(-1)
+        
+        # Flatten attention map if needed
+        if rl_attention_map.ndim == 4:
+            attention = rl_attention_map.squeeze(1)  # (B, H, W)
+        else:
+            attention = rl_attention_map  # (B, H, W)
+        
+        # Get prostate mask to only consider attention inside prostate
+        prostate_mask = data.get('prostate_mask', None)
+        if prostate_mask is not None:
+            prostate_mask = prostate_mask.to(device)
+            # Resize mask to match attention size if needed
+            if prostate_mask.shape[-2:] != attention.shape[-2:]:
+                prostate_mask = F.interpolate(
+                    prostate_mask.float(),
+                    size=attention.shape[-2:],
+                    mode='nearest'
+                )
+            if prostate_mask.ndim == 4:
+                prostate_mask = prostate_mask.squeeze(1)  # (B, H, W)
+        
+        penalties = []
+        for i in range(B):
+            inv = involvement[i].item()
+            
+            # Only penalize benign cases (involvement = 0)
+            if inv > 0:
+                penalties.append(0.0)
+                continue
+            
+            # Get attention for this sample
+            attn_i = attention[i]  # (H, W)
+            
+            # Apply prostate mask if available
+            if prostate_mask is not None:
+                mask_i = prostate_mask[i] > 0.5
+                if mask_i.sum() > 0:
+                    # Mean attention inside prostate
+                    mean_attn = attn_i[mask_i].mean().item()
+                else:
+                    mean_attn = attn_i.mean().item()
+            else:
+                mean_attn = attn_i.mean().item()
+            
+            # Penalty is proportional to mean attention (high attention = high penalty)
+            # Scale to make penalty meaningful (attention usually in 0-1 range)
+            penalty = mean_attn
+            penalties.append(penalty)
+        
+        return torch.tensor(penalties, device=device)
+    
     def compute_prostate_boundary_penalty(
         self,
         rl_coords: torch.Tensor,
@@ -430,6 +513,12 @@ class RLRewardComputer:
             diversity_bonus = self.compute_diversity_reward(rl_coords, num_samples_per_image)
             rewards = rewards + self.diversity_reward_weight * diversity_bonus
         
+        # Apply benign sparsity penalty if enabled (penalizes high attention in benign cases)
+        if self.benign_sparsity_penalty_weight > 0 and 'rl_attention_map' in outputs:
+            rl_attention_map = outputs['rl_attention_map']
+            sparsity_penalty = self.compute_benign_sparsity_penalty(rl_attention_map, data)
+            rewards = rewards - self.benign_sparsity_penalty_weight * sparsity_penalty
+        
         # Normalize if requested (usually disabled for GRPO)
         if self.normalize_rewards and rewards.numel() > 1:
             rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
@@ -507,6 +596,9 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
     # Diversity reward (prevents policy collapse)
     diversity_reward_weight = args.get('rl_diversity_reward_weight', 0.0)
     
+    # Benign sparsity penalty (encourages sparse attention in benign cases)
+    benign_sparsity_penalty_weight = args.get('rl_benign_sparsity_penalty_weight', 0.0)
+    
     return RLRewardComputer(
         reward_mode=reward_mode,
         cspca_bonus=cspca_bonus,
@@ -516,4 +608,5 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
         heatmap_reward_weight=heatmap_reward_weight,
         classification_reward_weight=classification_reward_weight,
         diversity_reward_weight=diversity_reward_weight,
+        benign_sparsity_penalty_weight=benign_sparsity_penalty_weight,
     )

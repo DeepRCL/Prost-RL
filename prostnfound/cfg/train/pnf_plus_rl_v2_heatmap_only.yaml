@@ -1,7 +1,9 @@
-# ProstNFound-RL V2 - Continuous Patch Attention
-# Uses full attention heatmap for decoder conditioning
+# ProstNFound-RL V2 - Heatmap Only (No Classification Head)
+# Focuses purely on heatmap/ROI performance
+# Uses only involvement-aware loss for heatmap (needle region)
+# RL trained only on ROI reward (heatmap performance)
 
-name: "PNF-RL-V2-continuous-classification_only-GRPO-BalancedLoss-Softmask-8Samples"
+name: "PNF-RL-V2-continuous-heatmap_only"
 
 data:
  fold: 0
@@ -28,11 +30,11 @@ data:
  rf_as_bmode: false
  include_rf: false
 
-# Model configuration - V2 with continuous attention
+# Model configuration - V2 with continuous attention, NO classification head
 model: prostnfound_rl_v2_adapter_medsam_legacy
 model_kw:
  prompts: [age, psa, psad, pos]
- use_class_decoder: true
+ use_class_decoder: false  # DISABLED - no classification head
  num_attention_patches: 4  # Not used in continuous mode but kept for compatibility
  policy_hidden_dim: 256
  use_clinical_in_policy: true
@@ -43,26 +45,21 @@ model_kw:
  upsample: false
  boundary_tolerance_patches: 2
 
-# Loss configuration
-loss: mil_prop_bce_entropy_reg
+# Loss configuration - ONLY heatmap loss (involvement-aware)
+loss: mil_prop_bce_entropy_reg  # Involvement-aware loss for needle region
 outside_prostate_penalty: false
-add_image_clf: true
-image_clf_mode: cspca
-image_clf_class_weight: balanced  # Automatically balance classes to handle dataset imbalance
+add_image_clf: false  # DISABLED - no classification loss
+# image_clf_mode: not needed since add_image_clf is false
+# image_clf_class_weight: not needed since add_image_clf is false
 
 # RL configuration
 use_rl: true
 rl_mode: grpo
 
-# Reward configuration
-rl_reward_mode: classification_only
- # Options:
- # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
- # - 'confidence_based': Reward high confidence on correct predictions
- # - 'classification_only': Only classification head performance
- # - 'roi_only': Only ROI/heatmap involvement accuracy
- # - 'loss_based': Negative BCE loss (legacy, not recommended)
-rl_cspca_bonus: 2
+# Reward configuration - ONLY heatmap/ROI performance
+rl_reward_mode: roi_only  # Only ROI/heatmap involvement accuracy
+ # roi_only: Reward based on how well heatmap predicts involvement
+ # Does NOT use classification head at all
 
 # Within-image comparison
 rl_num_samples_per_image: 4
@@ -73,14 +70,8 @@ rl_clip_eps: 0.1
 rl_entropy_coef: 0.005
 rl_kl_coef: 0.01
 rl_max_grad_norm: 0.25
-rl_loss_weight: 0.8
+rl_loss_weight: 0.8  # Weight for RL loss vs supervised loss
 rl_value_coef: 0.5
-
-# Benign Sparsity Penalty (NEW)
-# Penalizes high attention activation in benign cases (involvement=0)
-# This encourages the RL agent to produce sparse/low attention for non-cancer samples
-# Set to 0.0 to disable, try 0.3-1.0 to enable
-rl_benign_sparsity_penalty_weight: 0.0
 
 # Optimizer configuration
 optimizer: adamw
@@ -101,7 +92,7 @@ run_val: true
 
 project: prostnfound_rl_v2
 seed: 30
-tracked_metric: val/core_auc_high_involvement
+tracked_metric: val/core_auc_high_involvement  # Track heatmap performance
 
 wandb:
  mode: online

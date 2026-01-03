@@ -1,7 +1,7 @@
-# ProstNFound-RL V2 - Continuous Patch Attention
-# Uses full attention heatmap for decoder conditioning
+# ProstNFound-RL V2 - Continuous Patch Attention with PPO
+# Uses full attention heatmap for decoder conditioning with PPO algorithm
 
-name: "PNF-RL-V2-continuous-classification_only-GRPO-BalancedLoss-Softmask-8Samples"
+name: "PNF-RL-V2-continuous-classification_only-PPO-BalancedLoss-Softmask-8Samples"
 
 data:
  fold: 0
@@ -39,7 +39,7 @@ model_kw:
  freeze_prostnfound: false
  use_prostate_mask_constraint: true
  discrete_attention: false  # Continuous attention
- use_value_function: false
+ use_value_function: true  # PPO requires value function
  upsample: false
  boundary_tolerance_patches: 2
 
@@ -52,7 +52,7 @@ image_clf_class_weight: balanced  # Automatically balance classes to handle data
 
 # RL configuration
 use_rl: true
-rl_mode: grpo
+rl_mode: ppo  # Changed from grpo to ppo
 
 # Reward configuration
 rl_reward_mode: classification_only
@@ -64,17 +64,17 @@ rl_reward_mode: classification_only
  # - 'loss_based': Negative BCE loss (legacy, not recommended)
 rl_cspca_bonus: 2
 
-# Within-image comparison
-rl_num_samples_per_image: 4
+# PPO-specific: samples per image for policy updates
+rl_num_samples_per_image: 8
 
-# GRPO hyperparameters
-rl_num_update_epochs: 2
-rl_clip_eps: 0.1
-rl_entropy_coef: 0.005
-rl_kl_coef: 0.01
-rl_max_grad_norm: 0.25
-rl_loss_weight: 0.8
-rl_value_coef: 0.5
+# PPO hyperparameters
+rl_num_update_epochs: 4  # PPO typically uses more update epochs than GRPO
+rl_clip_eps: 0.2  # Standard PPO clipping parameter
+rl_entropy_coef: 0.01  # Encourage exploration
+rl_kl_coef: 0.0  # Not typically used in PPO (used in PPO-KL variant)
+rl_max_grad_norm: 0.5  # Gradient clipping for stability
+rl_loss_weight: 1.0  # Weight for RL loss component
+rl_value_coef: 0.5  # Value function loss coefficient
 
 # Benign Sparsity Penalty (NEW)
 # Penalizes high attention activation in benign cases (involvement=0)

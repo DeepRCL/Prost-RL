@@ -1,7 +1,8 @@
-# ProstNFound-RL V2 - Continuous Patch Attention
+# ProstNFound-RL V2 - Continuous Patch Attention with Sparse Benign Penalty
 # Uses full attention heatmap for decoder conditioning
+# NEW: Penalizes high attention in benign cases to encourage sparse attention
 
-name: "PNF-RL-V2-continuous-classification_only-GRPO-BalancedLoss-Softmask-8Samples"
+name: "PNF-RL-V2-continuous-classification_only-GRPO-SparseBenign"
 
 data:
  fold: 0
@@ -64,6 +65,12 @@ rl_reward_mode: classification_only
  # - 'loss_based': Negative BCE loss (legacy, not recommended)
 rl_cspca_bonus: 2
 
+# NEW: Benign Sparsity Penalty
+# This penalizes high attention activation in benign cases (involvement=0)
+# The RL agent will learn to produce sparse/low attention for non-cancer samples
+# while still activating strongly for cancer regions
+rl_benign_sparsity_penalty_weight: 0.5  # Penalty weight (0.0 = disabled, try 0.3-1.0)
+
 # Within-image comparison
 rl_num_samples_per_image: 4
 
@@ -75,12 +82,6 @@ rl_kl_coef: 0.01
 rl_max_grad_norm: 0.25
 rl_loss_weight: 0.8
 rl_value_coef: 0.5
-
-# Benign Sparsity Penalty (NEW)
-# Penalizes high attention activation in benign cases (involvement=0)
-# This encourages the RL agent to produce sparse/low attention for non-cancer samples
-# Set to 0.0 to disable, try 0.3-1.0 to enable
-rl_benign_sparsity_penalty_weight: 0.0
 
 # Optimizer configuration
 optimizer: adamw
