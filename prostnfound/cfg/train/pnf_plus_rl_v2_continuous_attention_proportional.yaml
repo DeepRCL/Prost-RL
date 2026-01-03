@@ -1,7 +1,8 @@
-# ProstNFound-RL V2 - Continuous Patch Attention
-# Uses full attention heatmap for decoder conditioning
+# ProstNFound-RL V2 - Attention Proportional Reward
+# Uses attention-proportional reward to teach RL agent clinically meaningful attention
+# This is a KEY experiment for publication
 
-name: "PNF-RL-V2-continuous-classification_only-GRPO-BalancedLoss-Softmask-8Samples"
+name: "PNF-RL-V2-continuous-attention_proportional-GRPO"
 
 data:
  fold: 0
@@ -48,22 +49,17 @@ loss: mil_prop_bce_entropy_reg
 outside_prostate_penalty: false
 add_image_clf: true
 image_clf_mode: cspca
-image_clf_class_weight: balanced  # Automatically balance classes to handle dataset imbalance
+image_clf_class_weight: balanced
 
 # RL configuration
 use_rl: true
 rl_mode: grpo
 
-# Reward configuration
-rl_reward_mode: classification_only
- # Options:
- # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
- # - 'classification_only': Only classification head performance
- # - 'classification_gated_needle': Only reward if cls correct + needle attention ~ involvement (NEW)
- # - 'attention_proportional': Reward attention proportional to true involvement
- # - 'roi_only': Only ROI/heatmap involvement accuracy
- # - 'confidence_based': Reward high confidence on correct predictions
- # - 'loss_based': Negative BCE loss (legacy, not recommended)
+# Reward configuration - ATTENTION PROPORTIONAL
+# This rewards the RL agent for producing attention that correlates with true involvement
+# For involvement=0.7: reward attention averaging ~0.7
+# For involvement=0.0: reward attention averaging ~0.0
+rl_reward_mode: attention_proportional
 rl_cspca_bonus: 2
 
 # Within-image comparison
@@ -78,11 +74,10 @@ rl_max_grad_norm: 0.25
 rl_loss_weight: 0.8
 rl_value_coef: 0.5
 
-# Benign Sparsity Penalty (NEW)
-# Penalizes high attention activation in benign cases (involvement=0)
-# This encourages the RL agent to produce sparse/low attention for non-cancer samples
-# Set to 0.0 to disable, try 0.3-1.0 to enable
-rl_benign_sparsity_penalty_weight: 0.0
+# Benign Sparsity Penalty
+# Additional penalty for high attention in benign cases
+# Works well with attention_proportional reward
+rl_benign_sparsity_penalty_weight: 0.3  # Moderate penalty
 
 # Optimizer configuration
 optimizer: adamw

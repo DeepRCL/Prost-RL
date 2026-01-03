@@ -24,11 +24,15 @@ class RLRewardComputer:
     2. Reward correct ROI involvement prediction (region awareness)
     3. Optionally penalize attention outside prostate
     4. Optionally reward diversity between samples (prevents policy collapse)
+    5. Optionally penalize high attention in benign cases (sparse benign)
     
     Reward Modes:
     - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
-    - 'confidence_based': Reward high confidence on correct predictions
     - 'classification_only': Only classification head performance
+    - 'classification_gated_needle': Only reward if cls correct, then needle attention ~ involvement (NEW)
+    - 'attention_proportional': Reward attention proportional to true involvement
+    - 'roi_only': Only ROI/heatmap involvement accuracy
+    - 'confidence_based': Reward high confidence on correct predictions
     - 'loss_based': Negative BCE loss (legacy)
     
     Args:
@@ -218,6 +222,251 @@ class RLRewardComputer:
             rewards = torch.where(cspca_mask, rewards * self.cspca_bonus, rewards)
         
         return rewards
+    
+    def compute_attention_proportional_reward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute reward based on attention being proportional to true involvement.
+        
+        This is a KEY metric for publication: it rewards the RL agent for producing
+        attention that correlates with the actual cancer involvement level.
+        
+        For involvement=0.7 (70% cancer): reward attention that averages ~0.7
+        For involvement=0.0 (benign): reward attention that averages ~0.0
+        
+        The reward is: 1 - |mean_attention - involvement|
+        Scaled to [-1, 1] range.
+        
+        Args:
+            outputs: Model outputs (must contain 'rl_attention_map')
+            data: Batch data (must contain 'involvement')
+            
+        Returns:
+            rewards: Attention-proportional rewards (B,)
+        """
+        if 'rl_attention_map' not in outputs:
+            # Fallback to classification reward if no attention map
+            return self.compute_classification_reward(outputs, data)
+        
+        rl_attention_map = outputs['rl_attention_map']
+        device = rl_attention_map.device
+        B = rl_attention_map.shape[0]
+        
+        # Handle dimension
+        if rl_attention_map.ndim == 4:
+            attention = rl_attention_map.squeeze(1)  # (B, H, W)
+        else:
+            attention = rl_attention_map  # (B, H, W)
+        
+        # Get true involvement
+        involvement = data['involvement'].to(device).float()
+        if involvement.ndim > 1:
+            involvement = involvement.squeeze(-1)
+        
+        # Get prostate mask to only consider attention inside prostate
+        prostate_mask = data.get('prostate_mask', None)
+        if prostate_mask is not None:
+            prostate_mask = prostate_mask.to(device)
+            if prostate_mask.shape[-2:] != attention.shape[-2:]:
+                prostate_mask = F.interpolate(
+                    prostate_mask.float(),
+                    size=attention.shape[-2:],
+                    mode='nearest'
+                )
+            if prostate_mask.ndim == 4:
+                prostate_mask = prostate_mask.squeeze(1)
+        
+        rewards = []
+        for i in range(B):
+            attn_i = attention[i]
+            inv_i = involvement[i].item()
+            
+            # Compute mean attention (inside prostate if mask available)
+            if prostate_mask is not None:
+                mask_i = prostate_mask[i] > 0.5
+                if mask_i.sum() > 0:
+                    mean_attn = attn_i[mask_i].mean().item()
+                else:
+                    mean_attn = attn_i.mean().item()
+            else:
+                mean_attn = attn_i.mean().item()
+            
+            # Reward = 1 - |mean_attention - involvement|
+            # This gives +1 when attention perfectly matches involvement
+            # and approaches 0 when they differ by 1.0
+            error = abs(mean_attn - inv_i)
+            reward = 1.0 - error
+            
+            # Scale to [-1, 1] range (was [0, 1])
+            reward = 2.0 * reward - 1.0
+            
+            rewards.append(reward)
+        
+        rewards = torch.tensor(rewards, device=device)
+        
+        # csPCa bonus
+        if 'grade_group' in data:
+            cspca_mask = data['grade_group'].to(device) > 2
+            if cspca_mask.ndim > 1:
+                cspca_mask = cspca_mask.squeeze(-1)
+            rewards = torch.where(cspca_mask, rewards * self.cspca_bonus, rewards)
+        
+        return rewards
+    
+    def compute_classification_gated_needle_reward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute reward that is GATED by correct classification.
+        
+        This is the KEY reward for publication:
+        1. Only give reward if classification head predicts correctly
+        2. If correct, reward proportional to how well attention in NEEDLE REGION
+           matches true involvement
+        3. Attention outside needle region is OK (might be other cancers)
+        
+        The intuition:
+        - For benign (inv=0): Reward if classified correctly AND attention in needle is low
+        - For cancer (inv>0): Reward if classified correctly AND attention in needle matches involvement
+        
+        This creates a SPARSE reward signal that only fires when both:
+        - Classification is correct
+        - Attention is clinically meaningful (matches involvement in needle region)
+        
+        Args:
+            outputs: Model outputs (needs 'rl_attention_map' and 'image_level_classification_outputs')
+            data: Batch data (needs 'involvement', 'label', 'needle_mask')
+            
+        Returns:
+            rewards: Gated rewards (B,), 0 if classification wrong
+        """
+        device = outputs.get('cancer_logits', outputs.get('mask_logits')).device
+        B = data['label'].shape[0]
+        
+        # Get classification predictions
+        cls_correct = self._check_classification_correct(outputs, data)
+        
+        # Get attention map
+        if 'rl_attention_map' not in outputs:
+            # If no attention map, fallback to classification-only reward
+            return self.compute_classification_reward(outputs, data)
+        
+        rl_attention_map = outputs['rl_attention_map']
+        if rl_attention_map.ndim == 4:
+            attention = rl_attention_map.squeeze(1)  # (B, H, W)
+        else:
+            attention = rl_attention_map  # (B, H, W)
+        
+        # Get needle mask - this is the key region for involvement
+        needle_mask = data.get('needle_mask', None)
+        if needle_mask is not None:
+            needle_mask = needle_mask.to(device)
+            if needle_mask.shape[-2:] != attention.shape[-2:]:
+                needle_mask = F.interpolate(
+                    needle_mask.float(),
+                    size=attention.shape[-2:],
+                    mode='nearest'
+                )
+            if needle_mask.ndim == 4:
+                needle_mask = needle_mask.squeeze(1)
+        
+        # Get true involvement
+        involvement = data['involvement'].to(device).float()
+        if involvement.ndim > 1:
+            involvement = involvement.squeeze(-1)
+        
+        rewards = []
+        for i in range(B):
+            is_correct = cls_correct[i].item() if isinstance(cls_correct[i], torch.Tensor) else cls_correct[i]
+            
+            # GATE: If classification is wrong, no reward
+            if not is_correct:
+                rewards.append(0.0)
+                continue
+            
+            # Classification is correct - now compute attention-involvement match in needle region
+            attn_i = attention[i]
+            inv_i = involvement[i].item()
+            
+            # Compute mean attention in needle region
+            if needle_mask is not None:
+                mask_i = needle_mask[i] > 0.5
+                if mask_i.sum() > 0:
+                    mean_attn_needle = attn_i[mask_i].mean().item()
+                else:
+                    # No needle region, use whole attention
+                    mean_attn_needle = attn_i.mean().item()
+            else:
+                mean_attn_needle = attn_i.mean().item()
+            
+            # Reward = how well needle attention matches involvement
+            # For inv=0: want mean_attn_needle close to 0
+            # For inv=0.7: want mean_attn_needle close to 0.7
+            error = abs(mean_attn_needle - inv_i)
+            
+            # Reward = 1 - error, scaled to [-1, 1]
+            # Perfect match: reward = 1
+            # Worst case (error = 1): reward = 0 -> scaled to -1
+            reward = 1.0 - error
+            reward = 2.0 * reward - 1.0
+            
+            rewards.append(reward)
+        
+        rewards = torch.tensor(rewards, device=device)
+        
+        # csPCa bonus (only for correct predictions with good attention)
+        if 'grade_group' in data:
+            cspca_mask = data['grade_group'].to(device) > 2
+            if cspca_mask.ndim > 1:
+                cspca_mask = cspca_mask.squeeze(-1)
+            # Only apply bonus to cases that got reward (classification correct)
+            bonus_mask = cspca_mask & (rewards > -1)  # rewards > -1 means classification was correct
+            rewards = torch.where(bonus_mask, rewards * self.cspca_bonus, rewards)
+        
+        return rewards
+    
+    def _check_classification_correct(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Check if classification head predicts correctly.
+        
+        Returns:
+            is_correct: Boolean tensor (B,) indicating if prediction is correct
+        """
+        if 'image_level_classification_outputs' not in outputs:
+            # No classification head, assume all correct to not gate
+            B = data['label'].shape[0]
+            return torch.ones(B, dtype=torch.bool, device=data['label'].device)
+        
+        cls_logits = outputs['image_level_classification_outputs'][0]  # (B, num_classes)
+        device = cls_logits.device
+        
+        # Get predictions
+        cls_preds = cls_logits.argmax(dim=1)  # (B,)
+        
+        # Get labels based on classification mode
+        if 'grade_group' in data:
+            # csPCa classification (grade_group > 2)
+            labels = (data['grade_group'].to(device) > 2).long()
+        else:
+            # Binary cancer classification
+            labels = data['label'].to(device).long()
+        
+        if labels.ndim > 1:
+            labels = labels.squeeze(-1)
+        
+        # Check correctness
+        is_correct = (cls_preds == labels)
+        
+        return is_correct
     
     def compute_confidence_based_reward(
         self,
@@ -493,6 +742,10 @@ class RLRewardComputer:
             rewards = self.compute_classification_reward(outputs, data)
         elif self.reward_mode == 'roi_only':
             rewards = self.compute_roi_involvement_reward(cancer_logits, data)
+        elif self.reward_mode == 'attention_proportional':
+            rewards = self.compute_attention_proportional_reward(outputs, data)
+        elif self.reward_mode == 'classification_gated_needle':
+            rewards = self.compute_classification_gated_needle_reward(outputs, data)
         else:
             # Legacy modes
             if self.reward_mode == 'loss_based':

@@ -740,6 +740,98 @@ def main(args):
             # For continuous mode, we still have attention maps
             if len(rl_accumulator['attention_maps']) > 0:
                 print(f"Collected {len(rl_accumulator['attention_maps'])} attention maps")
+        
+        # === NEW: Comprehensive RL Evaluation Metrics ===
+        if len(rl_accumulator.get('attention_maps', [])) > 0:
+            print("\n=== RL Attention-Involvement Metrics ===")
+            try:
+                # Concatenate all attention maps
+                all_attention = torch.cat(rl_accumulator['attention_maps'], dim=0)  # (N, H, W) or (N, 1, H, W)
+                if all_attention.ndim == 4:
+                    all_attention = all_attention.squeeze(1)
+                all_attention_np = all_attention.numpy()
+                
+                # Get involvement and labels from the results table
+                involvement_values = table['involvement'].values
+                label_values = table['label'].values
+                
+                # Ensure same length
+                N = min(len(all_attention_np), len(involvement_values))
+                all_attention_np = all_attention_np[:N]
+                involvement_values = involvement_values[:N]
+                label_values = label_values[:N]
+                
+                # Mean attention per sample
+                mean_attention = all_attention_np.mean(axis=(1, 2))
+                
+                # 1. Attention-Involvement Correlation
+                from scipy.stats import spearmanr, pearsonr
+                corr_spearman, p_value = spearmanr(mean_attention, involvement_values)
+                metrics['rl/attention_involvement_correlation_spearman'] = float(corr_spearman)
+                metrics['rl/attention_involvement_correlation_pvalue'] = float(p_value)
+                print(f"Attention-Involvement Correlation (Spearman): {corr_spearman:.4f} (p={p_value:.4e})")
+                
+                corr_pearson, _ = pearsonr(mean_attention, involvement_values)
+                metrics['rl/attention_involvement_correlation_pearson'] = float(corr_pearson)
+                print(f"Attention-Involvement Correlation (Pearson): {corr_pearson:.4f}")
+                
+                # 2. Benign vs Cancer Attention
+                benign_mask = label_values == 0
+                cancer_mask = label_values == 1
+                
+                if benign_mask.sum() > 0:
+                    benign_mean_attn = mean_attention[benign_mask].mean()
+                    metrics['rl/benign_mean_attention'] = float(benign_mean_attn)
+                    print(f"Benign Mean Attention: {benign_mean_attn:.4f}")
+                    
+                    # Sparsity: % below threshold
+                    SPARSITY_THRESH = 0.1
+                    benign_sparsity = (all_attention_np[benign_mask] < SPARSITY_THRESH).mean()
+                    metrics['rl/benign_attention_sparsity'] = float(benign_sparsity)
+                    print(f"Benign Attention Sparsity (<{SPARSITY_THRESH}): {benign_sparsity:.4f}")
+                
+                if cancer_mask.sum() > 0:
+                    cancer_mean_attn = mean_attention[cancer_mask].mean()
+                    metrics['rl/cancer_mean_attention'] = float(cancer_mean_attn)
+                    print(f"Cancer Mean Attention: {cancer_mean_attn:.4f}")
+                
+                # Attention Contrast
+                if benign_mask.sum() > 0 and cancer_mask.sum() > 0:
+                    attention_contrast = cancer_mean_attn - benign_mean_attn
+                    metrics['rl/attention_contrast'] = float(attention_contrast)
+                    print(f"Attention Contrast (Cancer - Benign): {attention_contrast:.4f}")
+                
+                # 3. Attention AUROC
+                if len(np.unique(label_values)) == 2:
+                    from sklearn.metrics import roc_auc_score
+                    attention_auroc = roc_auc_score(label_values, mean_attention)
+                    metrics['rl/attention_auroc'] = float(attention_auroc)
+                    print(f"Attention AUROC: {attention_auroc:.4f}")
+                
+                # 4. Calibration Error
+                calibration_error = np.abs(mean_attention - involvement_values).mean()
+                metrics['rl/attention_calibration_error'] = float(calibration_error)
+                print(f"Attention Calibration Error: {calibration_error:.4f}")
+                
+                # 5. Attention by involvement bin
+                for low, high in [(0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]:
+                    bin_mask = (involvement_values >= low) & (involvement_values < high)
+                    if bin_mask.sum() > 0:
+                        bin_mean_attn = mean_attention[bin_mask].mean()
+                        metrics[f'rl/attention_at_involvement_{low:.1f}_{high:.1f}'] = float(bin_mean_attn)
+                
+                # 6. Attention Entropy (diversity)
+                attention_flat = all_attention_np.reshape(N, -1)
+                attention_probs = attention_flat / (attention_flat.sum(axis=1, keepdims=True) + 1e-8)
+                entropy = -(attention_probs * np.log(attention_probs + 1e-8)).sum(axis=1)
+                max_entropy = np.log(attention_probs.shape[1])
+                normalized_entropy = entropy / max_entropy
+                metrics['rl/attention_entropy_mean'] = float(normalized_entropy.mean())
+                metrics['rl/attention_entropy_std'] = float(normalized_entropy.std())
+                print(f"Attention Entropy: {normalized_entropy.mean():.4f} ± {normalized_entropy.std():.4f}")
+                
+            except Exception as e:
+                print(f"Warning: Could not compute RL metrics: {e}")
 
         # Optionally save per-point attention probabilities and coordinates as CSV
         if 'rl_attention_point_records' in locals() and len(rl_attention_point_records) > 0:
