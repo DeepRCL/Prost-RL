@@ -1,7 +1,12 @@
-# ProstNFound-RL V2 - Continuous Patch Attention
-# Uses full attention heatmap for decoder conditioning
+# ProstNFound-RL V2 - Classification-Gated Needle Reward with Benign Penalty
+# This is the STRONGEST configuration for sparse benign attention
+# 
+# Key features:
+# 1. classification_gated_needle: Only reward when classification correct + needle attention ~ involvement
+# 2. benign_sparsity_penalty: Additional explicit penalty for high attention in benign cases
+# 3. Reduced entropy coefficient: Less exploration = more exploitation of learned patterns
 
-name: "PNF-RL-V2-continuous-classification_only-GRPO-BalancedLoss-Softmask-decoder"
+name: "PNF-RL-V2-continuous-gated_needle_strong-GRPO"
 
 data:
  fold: 0
@@ -32,10 +37,10 @@ data:
 model: prostnfound_rl_v2_adapter_medsam_legacy
 model_kw:
  prompts: [age, psa, psad, pos]
- use_clinical_in_policy: true
  use_class_decoder: true
- num_attention_patches: 4  # Not used in continuous mode but kept for compatibility
+ num_attention_patches: 4
  policy_hidden_dim: 256
+ use_clinical_in_policy: true
  freeze_prostnfound: false
  use_prostate_mask_constraint: true
  discrete_attention: false  # Continuous attention
@@ -48,41 +53,32 @@ loss: mil_prop_bce_entropy_reg
 outside_prostate_penalty: false
 add_image_clf: true
 image_clf_mode: cspca
-image_clf_class_weight: balanced  # Automatically balance classes to handle dataset imbalance
+image_clf_class_weight: balanced
 
 # RL configuration
 use_rl: true
 rl_mode: grpo
 
-# Reward configuration
-rl_reward_mode: classification_only
- # Options:
- # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
- # - 'classification_only': Only classification head performance
- # - 'classification_gated_needle': Only reward if cls correct + needle attention ~ involvement (NEW)
- # - 'attention_proportional': Reward attention proportional to true involvement
- # - 'roi_only': Only ROI/heatmap involvement accuracy
- # - 'confidence_based': Reward high confidence on correct predictions
- # - 'loss_based': Negative BCE loss (legacy, not recommended)
-rl_cspca_bonus: 2
+# Reward configuration - CLASSIFICATION GATED NEEDLE (NEW)
+rl_reward_mode: classification_gated_needle
+rl_cspca_bonus: 2.0
 
 # Within-image comparison
 rl_num_samples_per_image: 4
 
-# GRPO hyperparameters
-rl_num_update_epochs: 2
+# GRPO hyperparameters - TUNED FOR SPARSE ATTENTION
+rl_num_update_epochs: 3  # More updates per batch
 rl_clip_eps: 0.1
-rl_entropy_coef: 0.005
+rl_entropy_coef: 0.001  # REDUCED: Less exploration, more exploitation
 rl_kl_coef: 0.01
 rl_max_grad_norm: 0.25
-rl_loss_weight: 0.8
+rl_loss_weight: 1.0  # INCREASED: Stronger RL signal
 rl_value_coef: 0.5
 
-# Benign Sparsity Penalty (NEW)
-# Penalizes high attention activation in benign cases (involvement=0)
-# This encourages the RL agent to produce sparse/low attention for non-cancer samples
-# Set to 0.0 to disable, try 0.3-1.0 to enable
-rl_benign_sparsity_penalty_weight: 0.0
+# CRITICAL: Benign Sparsity Penalty - ENABLED
+# This adds EXPLICIT penalty for high attention in benign cases
+# Works on top of the classification_gated_needle reward
+rl_benign_sparsity_penalty_weight: 0.5  # Strong penalty for benign cases
 
 # Optimizer configuration
 optimizer: adamw
@@ -92,7 +88,7 @@ warmup_lr: 5.0e-05
 cnn_lr: 1.0e-05
 warmup_epochs: 1
 wd: 0.01
-epochs: 30
+epochs: 50  # More epochs to learn attention patterns
 accumulate_grad_steps: 1
 cutoff_epoch: null
 scheduler: cosine

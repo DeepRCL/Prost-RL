@@ -29,7 +29,10 @@ class RLRewardComputer:
     Reward Modes:
     - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
     - 'classification_only': Only classification head performance
-    - 'classification_gated_needle': Only reward if cls correct, then needle attention ~ involvement (NEW)
+    - 'hierarchical_gated': Sparse reward - only +1 when cls correct AND attention right (SPARSE)
+    - 'attention_contrast': Push benign attention down, cancer attention up
+    - 'sparse_attention': Penalize benign attention, reward cancer attention
+    - 'classification_gated_needle': Only reward if cls correct, then needle attention ~ involvement
     - 'attention_proportional': Reward attention proportional to true involvement
     - 'roi_only': Only ROI/heatmap involvement accuracy
     - 'confidence_based': Reward high confidence on correct predictions
@@ -430,6 +433,341 @@ class RLRewardComputer:
         
         return rewards
     
+    def compute_sparse_attention_reward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute reward that STRONGLY encourages sparse attention for benign cases
+        and focused attention for cancer cases.
+        
+        This is designed to fix the "inverted attention" problem where the model
+        attends MORE to benign cases than cancer cases.
+        
+        The reward structure:
+        - For BENIGN (inv=0): 
+          * High attention → Strong NEGATIVE reward
+          * Low attention → Positive reward
+          * Formula: reward = 1 - 2*mean_attention (range: [-1, 1])
+        
+        - For CANCER (inv>0):
+          * Reward = classification reward (unchanged)
+          * Plus bonus if attention is present
+          
+        This ASYMMETRIC treatment ensures the model learns:
+        - Benign → Low/sparse attention
+        - Cancer → Classification-driven (with attention allowed)
+        
+        Args:
+            outputs: Model outputs
+            data: Batch data
+            
+        Returns:
+            rewards: Sparse attention rewards (B,)
+        """
+        if 'rl_attention_map' not in outputs:
+            return self.compute_classification_reward(outputs, data)
+        
+        rl_attention_map = outputs['rl_attention_map']
+        device = rl_attention_map.device
+        B = rl_attention_map.shape[0]
+        
+        if rl_attention_map.ndim == 4:
+            attention = rl_attention_map.squeeze(1)
+        else:
+            attention = rl_attention_map
+        
+        # Get involvement
+        involvement = data['involvement'].to(device).float()
+        if involvement.ndim > 1:
+            involvement = involvement.squeeze(-1)
+        
+        # Get prostate mask for computing attention
+        prostate_mask = data.get('prostate_mask', None)
+        if prostate_mask is not None:
+            prostate_mask = prostate_mask.to(device)
+            if prostate_mask.shape[-2:] != attention.shape[-2:]:
+                prostate_mask = F.interpolate(
+                    prostate_mask.float(),
+                    size=attention.shape[-2:],
+                    mode='nearest'
+                )
+            if prostate_mask.ndim == 4:
+                prostate_mask = prostate_mask.squeeze(1)
+        
+        # Get classification reward for cancer cases
+        cls_reward = self.compute_classification_reward(outputs, data)
+        
+        rewards = []
+        for i in range(B):
+            inv_i = involvement[i].item()
+            attn_i = attention[i]
+            
+            # Compute mean attention in prostate
+            if prostate_mask is not None:
+                mask_i = prostate_mask[i] > 0.5
+                if mask_i.sum() > 0:
+                    mean_attn = attn_i[mask_i].mean().item()
+                else:
+                    mean_attn = attn_i.mean().item()
+            else:
+                mean_attn = attn_i.mean().item()
+            
+            if inv_i == 0:
+                # BENIGN case: STRONGLY penalize high attention
+                # reward = 1 when attention=0, reward = -1 when attention=1
+                reward = 1.0 - 2.0 * mean_attn
+                rewards.append(reward)
+            else:
+                # CANCER case: Use classification reward
+                # Add small bonus if attention is present (encourages some activation)
+                attention_bonus = 0.1 * mean_attn if mean_attn > 0.1 else 0.0
+                reward = cls_reward[i].item() + attention_bonus
+                rewards.append(reward)
+        
+        rewards_tensor = torch.tensor(rewards, device=device)
+        
+        # csPCa bonus for cancer cases
+        if 'grade_group' in data:
+            cspca_mask = data['grade_group'].to(device) > 2
+            if cspca_mask.ndim > 1:
+                cspca_mask = cspca_mask.squeeze(-1)
+            cancer_mask = involvement > 0
+            bonus_mask = cspca_mask & cancer_mask
+            rewards_tensor = torch.where(bonus_mask, rewards_tensor * self.cspca_bonus, rewards_tensor)
+        
+        return rewards_tensor
+    
+    def compute_attention_contrast_reward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Compute reward that directly maximizes CONTRAST between cancer and benign attention.
+        
+        This addresses the issue where sparse_attention pushed BOTH cancer and benign
+        attention down. We need SYMMETRIC strong signals:
+        - BENIGN (inv=0): reward = -mean_attention (push DOWN)
+        - CANCER (inv>0): reward = +mean_attention (push UP)
+        
+        Combined with classification reward to maintain accuracy.
+        
+        The net effect should be:
+        - Benign attention → 0
+        - Cancer attention → 1
+        - Maximum contrast
+        
+        Args:
+            outputs: Model outputs
+            data: Batch data
+            
+        Returns:
+            rewards: Contrast-maximizing rewards (B,)
+        """
+        if 'rl_attention_map' not in outputs:
+            return self.compute_classification_reward(outputs, data)
+        
+        rl_attention_map = outputs['rl_attention_map']
+        device = rl_attention_map.device
+        B = rl_attention_map.shape[0]
+        
+        if rl_attention_map.ndim == 4:
+            attention = rl_attention_map.squeeze(1)
+        else:
+            attention = rl_attention_map
+        
+        # Get involvement
+        involvement = data['involvement'].to(device).float()
+        if involvement.ndim > 1:
+            involvement = involvement.squeeze(-1)
+        
+        # Get prostate mask
+        prostate_mask = data.get('prostate_mask', None)
+        if prostate_mask is not None:
+            prostate_mask = prostate_mask.to(device)
+            if prostate_mask.shape[-2:] != attention.shape[-2:]:
+                prostate_mask = F.interpolate(
+                    prostate_mask.float(),
+                    size=attention.shape[-2:],
+                    mode='nearest'
+                )
+            if prostate_mask.ndim == 4:
+                prostate_mask = prostate_mask.squeeze(1)
+        
+        # Get classification reward as baseline
+        cls_reward = self.compute_classification_reward(outputs, data)
+        
+        # Attention contrast weight (how much to weight attention vs classification)
+        ATTN_WEIGHT = 0.5  # Tune this: higher = more focus on attention contrast
+        
+        rewards = []
+        for i in range(B):
+            inv_i = involvement[i].item()
+            attn_i = attention[i]
+            cls_r = cls_reward[i].item()
+            
+            # Compute mean attention in prostate
+            if prostate_mask is not None:
+                mask_i = prostate_mask[i] > 0.5
+                if mask_i.sum() > 0:
+                    mean_attn = attn_i[mask_i].mean().item()
+                else:
+                    mean_attn = attn_i.mean().item()
+            else:
+                mean_attn = attn_i.mean().item()
+            
+            if inv_i == 0:
+                # BENIGN: Reward = cls_reward + (-attention) * weight
+                # Low attention → bonus, high attention → penalty
+                attn_component = (0.0 - mean_attn)/0.5 * ATTN_WEIGHT  # target=0, scale by 0.5
+                attn_component = max(-1.0, min(1.0, attn_component))  # clip
+                reward = cls_r + attn_component
+            else:
+                # CANCER: Reward = cls_reward + (+attention) * weight
+                # High attention → bonus, low attention → penalty
+                attn_component = (mean_attn - 0.5)/0.5 * ATTN_WEIGHT  # target=1, but centered at 0.5
+                attn_component = max(-1.0, min(1.0, attn_component))  # clip
+                reward = cls_r + attn_component
+            
+            rewards.append(reward)
+        
+        rewards_tensor = torch.tensor(rewards, device=device)
+        
+        # csPCa bonus for cancer cases
+        if 'grade_group' in data:
+            cspca_mask = data['grade_group'].to(device) > 2
+            if cspca_mask.ndim > 1:
+                cspca_mask = cspca_mask.squeeze(-1)
+            cancer_mask = involvement > 0
+            bonus_mask = cspca_mask & cancer_mask
+            rewards_tensor = torch.where(bonus_mask, rewards_tensor * self.cspca_bonus, rewards_tensor)
+        
+        return rewards_tensor
+    
+    def compute_hierarchical_gated_reward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Hierarchical/Gated Reward: Sparse but clear signal.
+        
+        This is designed for SPARSE REWARD learning:
+        1. If classification is WRONG → negative reward (-1)
+        2. If classification is CORRECT → reward based on attention quality
+           - BENIGN + low attention → positive reward (+1)
+           - BENIGN + high attention → small penalty (0)
+           - CANCER + high attention → positive reward (+1)
+           - CANCER + low attention → small penalty (0)
+        
+        The reward is SPARSE: only fires strongly when BOTH conditions are met.
+        This requires more exploration (higher entropy) but gives cleaner signal.
+        
+        Reward distribution:
+        - +1: Classification correct AND attention appropriate
+        - 0: Classification correct BUT attention wrong
+        - -1: Classification wrong (regardless of attention)
+        
+        Args:
+            outputs: Model outputs
+            data: Batch data
+            
+        Returns:
+            rewards: Hierarchical gated rewards (B,)
+        """
+        if 'rl_attention_map' not in outputs:
+            return self.compute_classification_reward(outputs, data)
+        
+        rl_attention_map = outputs['rl_attention_map']
+        device = rl_attention_map.device
+        B = rl_attention_map.shape[0]
+        
+        if rl_attention_map.ndim == 4:
+            attention = rl_attention_map.squeeze(1)
+        else:
+            attention = rl_attention_map
+        
+        # Get involvement
+        involvement = data['involvement'].to(device).float()
+        if involvement.ndim > 1:
+            involvement = involvement.squeeze(-1)
+        
+        # Get prostate mask
+        prostate_mask = data.get('prostate_mask', None)
+        if prostate_mask is not None:
+            prostate_mask = prostate_mask.to(device)
+            if prostate_mask.shape[-2:] != attention.shape[-2:]:
+                prostate_mask = F.interpolate(
+                    prostate_mask.float(),
+                    size=attention.shape[-2:],
+                    mode='nearest'
+                )
+            if prostate_mask.ndim == 4:
+                prostate_mask = prostate_mask.squeeze(1)
+        
+        # Check classification correctness
+        cls_correct = self._check_classification_correct(outputs, data)
+        
+        # Thresholds for attention quality
+        BENIGN_MAX_ATTN = 0.15  # Benign should have attention below this
+        CANCER_MIN_ATTN = 0.10  # Cancer should have attention above this
+        
+        rewards = []
+        for i in range(B):
+            inv_i = involvement[i].item()
+            attn_i = attention[i]
+            is_correct = cls_correct[i].item() if isinstance(cls_correct[i], torch.Tensor) else cls_correct[i]
+            
+            # Compute mean attention in prostate
+            if prostate_mask is not None:
+                mask_i = prostate_mask[i] > 0.5
+                if mask_i.sum() > 0:
+                    mean_attn = attn_i[mask_i].mean().item()
+                else:
+                    mean_attn = attn_i.mean().item()
+            else:
+                mean_attn = attn_i.mean().item()
+            
+            # GATE 1: Classification must be correct
+            if not is_correct:
+                rewards.append(-1.0)  # Strong negative for wrong classification
+                continue
+            
+            # GATE 2: Attention quality (only if classification correct)
+            if inv_i == 0:
+                # BENIGN: Want low attention
+                if mean_attn < BENIGN_MAX_ATTN:
+                    reward = 1.0  # Good: low attention for benign
+                else:
+                    # Smooth penalty: higher attention = lower reward
+                    reward = max(0.0, 1.0 - (mean_attn - BENIGN_MAX_ATTN) / 0.5)
+            else:
+                # CANCER: Want high attention
+                if mean_attn > CANCER_MIN_ATTN:
+                    # Good: some attention for cancer
+                    # Bonus scales with attention level
+                    reward = min(1.0, 0.5 + mean_attn)
+                else:
+                    # Low attention for cancer = small penalty
+                    reward = 0.0
+            
+            rewards.append(reward)
+        
+        rewards_tensor = torch.tensor(rewards, device=device)
+        
+        # csPCa bonus
+        if 'grade_group' in data:
+            cspca_mask = data['grade_group'].to(device) > 2
+            if cspca_mask.ndim > 1:
+                cspca_mask = cspca_mask.squeeze(-1)
+            cancer_mask = involvement > 0
+            bonus_mask = cspca_mask & cancer_mask & (rewards_tensor > 0)
+            rewards_tensor = torch.where(bonus_mask, rewards_tensor * self.cspca_bonus, rewards_tensor)
+        
+        return rewards_tensor
+    
     def _check_classification_correct(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -746,6 +1084,12 @@ class RLRewardComputer:
             rewards = self.compute_attention_proportional_reward(outputs, data)
         elif self.reward_mode == 'classification_gated_needle':
             rewards = self.compute_classification_gated_needle_reward(outputs, data)
+        elif self.reward_mode == 'sparse_attention':
+            rewards = self.compute_sparse_attention_reward(outputs, data)
+        elif self.reward_mode == 'attention_contrast':
+            rewards = self.compute_attention_contrast_reward(outputs, data)
+        elif self.reward_mode == 'hierarchical_gated':
+            rewards = self.compute_hierarchical_gated_reward(outputs, data)
         else:
             # Legacy modes
             if self.reward_mode == 'loss_based':

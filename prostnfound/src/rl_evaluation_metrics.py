@@ -171,6 +171,62 @@ class RLAttentionEvaluator:
         metrics['rl/attention_entropy_mean'] = float(normalized_entropy.mean())
         metrics['rl/attention_entropy_std'] = float(normalized_entropy.std())
         
+        # ============================================================
+        # 7. NEEDLE FOCUS RATIO (Key Interpretability Metric)
+        # For CANCER cases: is attention higher INSIDE needle than OUTSIDE?
+        # This validates that RL attention is focusing on the right region.
+        # 
+        # Ratio > 1.0 means attention correctly focuses on needle/tumor
+        # Ratio < 1.0 means attention is scattered or in wrong places
+        # ============================================================
+        if len(self.needle_masks) > 0 and len(self.prostate_masks) > 0:
+            needle_masks = torch.cat(self.needle_masks, dim=0).numpy()
+            prostate_masks = torch.cat(self.prostate_masks, dim=0).numpy()
+            
+            if needle_masks.ndim == 4:
+                needle_masks = needle_masks.squeeze(1)
+            if prostate_masks.ndim == 4:
+                prostate_masks = prostate_masks.squeeze(1)
+            
+            # Resize masks if needed
+            if needle_masks.shape[-2:] != attention_maps.shape[-2:]:
+                import torch.nn.functional as F
+                needle_masks = F.interpolate(
+                    torch.from_numpy(needle_masks).unsqueeze(1).float(),
+                    size=attention_maps.shape[-2:],
+                    mode='nearest'
+                ).squeeze(1).numpy()
+                prostate_masks = F.interpolate(
+                    torch.from_numpy(prostate_masks).unsqueeze(1).float(),
+                    size=attention_maps.shape[-2:],
+                    mode='nearest'
+                ).squeeze(1).numpy()
+            
+            # Compute for CANCER cases only
+            needle_focus_ratios = []
+            for i in range(B):
+                if labels[i] == 0:  # Skip benign
+                    continue
+                
+                attn_i = attention_maps[i]
+                needle_i = needle_masks[i] > 0.5
+                prostate_i = prostate_masks[i] > 0.5
+                outside_needle = prostate_i & (~needle_i)
+                
+                if needle_i.sum() > 0 and outside_needle.sum() > 0:
+                    mean_inside = attn_i[needle_i].mean()
+                    mean_outside = attn_i[outside_needle].mean()
+                    if mean_outside > 1e-6:
+                        ratio = mean_inside / mean_outside
+                        needle_focus_ratios.append(ratio)
+            
+            if len(needle_focus_ratios) > 0:
+                mean_ratio = np.mean(needle_focus_ratios)
+                metrics['rl/cancer_needle_focus_ratio'] = float(mean_ratio)
+                metrics['rl/cancer_needle_focus_correct_pct'] = float(
+                    np.mean([r > 1.0 for r in needle_focus_ratios]) * 100
+                )
+        
         return metrics
     
     def get_visualization_data(self) -> Dict[str, np.ndarray]:

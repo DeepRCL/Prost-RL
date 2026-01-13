@@ -1,0 +1,97 @@
+# ProstNFound-RL V2 - SUPERVISED MODE (No RL)
+# This is for comparison with RL version
+# 
+# Same architecture as RL model but trained with standard supervised loss only.
+# The attention mechanism will be trained implicitly through the decoder gradients.
+# NO SAMPLING - just standard single forward pass per batch.
+#
+# Compare this with RL models to see if RL provides any benefit.
+
+name: "PNF-RL-V2-continuous-SUPERVISED-BalancedLoss-noprompts"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 16
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# Model configuration - SAME as RL version
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: []
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ use_clinical_in_policy: true
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ discrete_attention: false  # Continuous attention
+ use_value_function: false  # Not needed for supervised
+ upsample: false
+ boundary_tolerance_patches: 2
+
+# Loss configuration - SAME as RL version
+loss: mil_prop_bce_entropy_reg
+outside_prostate_penalty: false
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# RL configuration - DISABLED for supervised training
+use_rl: false
+
+# Optimizer configuration - SAME as RL version
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 8.0e-06
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.01
+epochs: 40
+accumulate_grad_steps: 1
+cutoff_epoch: null
+scheduler: cosine
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_rl_v2
+seed: 30
+tracked_metric: val/core_auc_high_involvement
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v2/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

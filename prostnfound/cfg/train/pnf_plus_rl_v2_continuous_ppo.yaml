@@ -1,7 +1,7 @@
 # ProstNFound-RL V2 - Continuous Patch Attention with PPO
 # Uses full attention heatmap for decoder conditioning with PPO algorithm
 
-name: "PNF-RL-V2-continuous-classification_only-PPO-BalancedLoss-Softmask-8Samples"
+name: "PNF-RL-V2-continuous-classification_only-PPO-BalancedLoss-Softmask-noprompts"
 
 data:
  fold: 0
@@ -31,11 +31,11 @@ data:
 # Model configuration - V2 with continuous attention
 model: prostnfound_rl_v2_adapter_medsam_legacy
 model_kw:
- prompts: [age, psa, psad, pos]
+ prompts: []
  use_class_decoder: true
  num_attention_patches: 4  # Not used in continuous mode but kept for compatibility
  policy_hidden_dim: 256
- use_clinical_in_policy: true
+ use_clinical_in_policy: false
  freeze_prostnfound: false
  use_prostate_mask_constraint: true
  discrete_attention: false  # Continuous attention
@@ -65,7 +65,7 @@ rl_reward_mode: classification_only
 rl_cspca_bonus: 2
 
 # PPO-specific: samples per image for policy updates
-rl_num_samples_per_image: 8
+rl_num_samples_per_image: 4
 
 # PPO hyperparameters
 rl_num_update_epochs: 4  # PPO typically uses more update epochs than GRPO
@@ -90,7 +90,7 @@ warmup_lr: 5.0e-05
 cnn_lr: 1.0e-05
 warmup_epochs: 1
 wd: 0.01
-epochs: 40
+epochs: 30
 accumulate_grad_steps: 1
 cutoff_epoch: null
 scheduler: cosine

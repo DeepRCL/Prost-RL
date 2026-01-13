@@ -225,6 +225,11 @@ def main(args):
             # For both discrete and continuous: store attention maps
             if 'rl_attention_map' in data and data['rl_attention_map'] is not None:
                 rl_accumulator['attention_maps'].append(data['rl_attention_map'].cpu())
+            # Store masks for Needle Focus Ratio metric
+            if 'needle_mask' in data:
+                rl_accumulator['needle_mask'].append(data['needle_mask'].cpu())
+            if 'prostate_mask' in data:
+                rl_accumulator['prostate_mask'].append(data['prostate_mask'].cpu())
 
         if args.save_raw_heatmaps:
             # get raw heatmap and also save as png
@@ -829,6 +834,59 @@ def main(args):
                 metrics['rl/attention_entropy_mean'] = float(normalized_entropy.mean())
                 metrics['rl/attention_entropy_std'] = float(normalized_entropy.std())
                 print(f"Attention Entropy: {normalized_entropy.mean():.4f} ± {normalized_entropy.std():.4f}")
+                
+                # 7. Needle Focus Ratio (KEY INTERPRETABILITY METRIC)
+                # For cancer cases: is attention higher inside needle than outside?
+                if 'needle_mask' in rl_accumulator and 'prostate_mask' in rl_accumulator:
+                    needle_masks = rl_accumulator.get('needle_mask', [])
+                    prostate_masks = rl_accumulator.get('prostate_mask', [])
+                    if len(needle_masks) > 0:
+                        needle_masks_np = torch.cat(needle_masks, dim=0).numpy()[:N]
+                        prostate_masks_np = torch.cat(prostate_masks, dim=0).numpy()[:N]
+                        
+                        if needle_masks_np.ndim == 4:
+                            needle_masks_np = needle_masks_np.squeeze(1)
+                        if prostate_masks_np.ndim == 4:
+                            prostate_masks_np = prostate_masks_np.squeeze(1)
+                        
+                        # Resize if needed
+                        if needle_masks_np.shape[-2:] != all_attention_np.shape[-2:]:
+                            import torch.nn.functional as F
+                            needle_masks_np = F.interpolate(
+                                torch.from_numpy(needle_masks_np).unsqueeze(1).float(),
+                                size=all_attention_np.shape[-2:],
+                                mode='nearest'
+                            ).squeeze(1).numpy()
+                            prostate_masks_np = F.interpolate(
+                                torch.from_numpy(prostate_masks_np).unsqueeze(1).float(),
+                                size=all_attention_np.shape[-2:],
+                                mode='nearest'
+                            ).squeeze(1).numpy()
+                        
+                        needle_focus_ratios = []
+                        for i in range(N):
+                            if label_values[i] == 0:  # Skip benign
+                                continue
+                            
+                            attn_i = all_attention_np[i]
+                            needle_i = needle_masks_np[i] > 0.5
+                            prostate_i = prostate_masks_np[i] > 0.5
+                            outside_needle = prostate_i & (~needle_i)
+                            
+                            if needle_i.sum() > 0 and outside_needle.sum() > 0:
+                                mean_inside = attn_i[needle_i].mean()
+                                mean_outside = attn_i[outside_needle].mean()
+                                if mean_outside > 1e-6:
+                                    ratio = mean_inside / mean_outside
+                                    needle_focus_ratios.append(ratio)
+                        
+                        if len(needle_focus_ratios) > 0:
+                            mean_ratio = float(np.mean(needle_focus_ratios))
+                            correct_pct = float(np.mean([r > 1.0 for r in needle_focus_ratios]) * 100)
+                            metrics['rl/cancer_needle_focus_ratio'] = mean_ratio
+                            metrics['rl/cancer_needle_focus_correct_pct'] = correct_pct
+                            print(f"Cancer Needle Focus Ratio: {mean_ratio:.4f}")
+                            print(f"Cancer Needle Focus Correct %: {correct_pct:.1f}%")
                 
             except Exception as e:
                 print(f"Warning: Could not compute RL metrics: {e}")

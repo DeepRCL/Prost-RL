@@ -1,7 +1,17 @@
-# ProstNFound-RL V2 - Continuous Patch Attention
-# Uses full attention heatmap for decoder conditioning
+# ProstNFound-RL V2 - Sparse Attention Reward
+# This is designed to fix the "inverted attention" problem
+# 
+# Key insight: The model was attending MORE to benign cases than cancer cases!
+# This reward mode uses ASYMMETRIC treatment:
+# - BENIGN (inv=0): STRONGLY penalize high attention (reward = 1 - 2*attention)
+# - CANCER (inv>0): Use classification reward + small attention bonus
+#
+# This directly enforces:
+# - Low attention for benign → gets positive reward
+# - High attention for benign → gets STRONG negative reward
+# - Cancer cases: classification-driven with allowed attention
 
-name: "PNF-RL-V2-continuous-classification_only-GRPO-BalancedLoss-Softmask-decoder"
+name: "PNF-RL-V2-continuous-sparse_attention-GRPO"
 
 data:
  fold: 0
@@ -32,10 +42,10 @@ data:
 model: prostnfound_rl_v2_adapter_medsam_legacy
 model_kw:
  prompts: [age, psa, psad, pos]
- use_clinical_in_policy: true
  use_class_decoder: true
- num_attention_patches: 4  # Not used in continuous mode but kept for compatibility
+ num_attention_patches: 4
  policy_hidden_dim: 256
+ use_clinical_in_policy: true
  freeze_prostnfound: false
  use_prostate_mask_constraint: true
  discrete_attention: false  # Continuous attention
@@ -48,40 +58,33 @@ loss: mil_prop_bce_entropy_reg
 outside_prostate_penalty: false
 add_image_clf: true
 image_clf_mode: cspca
-image_clf_class_weight: balanced  # Automatically balance classes to handle dataset imbalance
+image_clf_class_weight: balanced
 
 # RL configuration
 use_rl: true
 rl_mode: grpo
 
-# Reward configuration
-rl_reward_mode: classification_only
- # Options:
- # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
- # - 'classification_only': Only classification head performance
- # - 'classification_gated_needle': Only reward if cls correct + needle attention ~ involvement (NEW)
- # - 'attention_proportional': Reward attention proportional to true involvement
- # - 'roi_only': Only ROI/heatmap involvement accuracy
- # - 'confidence_based': Reward high confidence on correct predictions
- # - 'loss_based': Negative BCE loss (legacy, not recommended)
-rl_cspca_bonus: 2
+# Reward configuration - SPARSE ATTENTION (Fixes inverted attention)
+# This reward mode uses ASYMMETRIC treatment:
+# - BENIGN: reward = 1 - 2*mean_attention (strongly penalizes high attention)
+# - CANCER: classification reward + attention bonus
+rl_reward_mode: sparse_attention
+rl_cspca_bonus: 2.0
 
 # Within-image comparison
 rl_num_samples_per_image: 4
 
-# GRPO hyperparameters
-rl_num_update_epochs: 2
+# GRPO hyperparameters - TUNED FOR SPARSE ATTENTION
+rl_num_update_epochs: 3  # More updates for clearer signal
 rl_clip_eps: 0.1
-rl_entropy_coef: 0.005
+rl_entropy_coef: 0.001  # REDUCED: Less exploration, more exploitation
 rl_kl_coef: 0.01
 rl_max_grad_norm: 0.25
-rl_loss_weight: 0.8
+rl_loss_weight: 1.0  # Full RL signal
 rl_value_coef: 0.5
 
-# Benign Sparsity Penalty (NEW)
-# Penalizes high attention activation in benign cases (involvement=0)
-# This encourages the RL agent to produce sparse/low attention for non-cancer samples
-# Set to 0.0 to disable, try 0.3-1.0 to enable
+# Benign Sparsity Penalty - ADDITIONAL penalty on top of sparse_attention
+# This can be 0 since sparse_attention already handles benign cases
 rl_benign_sparsity_penalty_weight: 0.0
 
 # Optimizer configuration
@@ -92,7 +95,7 @@ warmup_lr: 5.0e-05
 cnn_lr: 1.0e-05
 warmup_epochs: 1
 wd: 0.01
-epochs: 30
+epochs: 50  # More epochs for attention pattern learning
 accumulate_grad_steps: 1
 cutoff_epoch: null
 scheduler: cosine
