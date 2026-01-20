@@ -70,3 +70,7 @@ device: cuda        # Device to use (e.g., cuda, cpu)
 use_amp: false      # Use automatic mixed precision
 torch_compile: false  # Use torch.compile if supported
 
+# === Decoder Prostate Mask Constraint ===
+# Apply hard mask to decoder output during inference (set predictions outside prostate to 0)
+apply_prostate_mask_to_decoder: true
+boundary_tolerance_patches: 1  # Pixels to dilate prostate mask boundary (matches RL)

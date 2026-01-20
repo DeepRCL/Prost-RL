@@ -165,6 +165,7 @@ class CancerLogitsHeatmapsEvaluator:
             "grade_group",
             "average_needle_heatmap_value",
             "average_prostate_heatmap_value",
+            "thresholded_needle_involvement",
             "label",
             "involvement",
             "clinically_significant",
@@ -219,21 +220,60 @@ class CancerLogitsHeatmapsEvaluator:
         ).mean()
 
         # balanced prop pred err
-        results_table["prop_pred_err"] = (
+        results_table["prop_pred_err"] = np.abs(
             results_table["average_needle_heatmap_value"] - results_table["involvement"]
-        ).abs()
+        )
         metrics["bal_prop_pred_err"] = (
             results_table.query("label == 0")["prop_pred_err"].mean()
             + results_table.query("label == 1")["prop_pred_err"].mean()
         ) / 2
 
-        # balanced prob pred err using thresholded probabilities
-        # prop_pred_err_t30 = (
-        #     results_table.query("mean_binarized_act_t=30 > 0.5")["involvement"]
-        #     - results_table.query("mean_binarized_act_t=30 > 0.5")[
-        #         "average_needle_heatmap_value"
-        #     ]
-        # ).abs().mean()
+        # === THRESHOLDED INVOLVEMENT METRICS ===
+        # Calculate metrics using thresholded involvement (binary activations > 0.5)
+        if "thresholded_needle_involvement" in results_table.columns:
+            thresholded_preds = results_table["thresholded_needle_involvement"].values
+            
+            # Thresholded AUC (using binary involvement as predictions)
+            metrics["core_auc_thresholded"] = _auc_roc(thresholded_preds, labels)
+            
+            # Thresholded involvement prediction error
+            metrics["prop_pred_err_thresholded"] = np.abs(
+                thresholded_preds - involvement
+            ).mean()
+            
+            # Balanced thresholded involvement prediction error
+            results_table["prop_pred_err_thresholded"] = np.abs(
+                thresholded_preds - involvement
+            )
+            metrics["bal_prop_pred_err_thresholded"] = (
+                results_table.query("label == 0")["prop_pred_err_thresholded"].mean()
+                + results_table.query("label == 1")["prop_pred_err_thresholded"].mean()
+            ) / 2
+            
+            # Correlation between thresholded predictions and true involvement
+            from scipy.stats import spearmanr, pearsonr
+            valid_mask = ~(np.isnan(thresholded_preds) | np.isnan(involvement))
+            if valid_mask.sum() > 2:
+                corr_spearman, p_val = spearmanr(
+                    thresholded_preds[valid_mask], 
+                    involvement[valid_mask]
+                )
+                metrics["thresholded_involvement_correlation_spearman"] = float(corr_spearman)
+                metrics["thresholded_involvement_correlation_pvalue"] = float(p_val)
+                
+                corr_pearson, _ = pearsonr(
+                    thresholded_preds[valid_mask], 
+                    involvement[valid_mask]
+                )
+                metrics["thresholded_involvement_correlation_pearson"] = float(corr_pearson)
+            
+            # Thresholded predictions for high involvement cases
+            high_inv_mask = (involvement > 0.4) | (labels == 0)
+            if high_inv_mask.sum() > 0:
+                metrics["core_auc_thresholded_high_involvement"] = _auc_roc(
+                    thresholded_preds[high_inv_mask],
+                    labels[high_inv_mask]
+                )
 
         # high involvement core predictions
         high_involvement = involvement > 0.4
@@ -307,4 +347,72 @@ class CancerLogitsHeatmapsEvaluator:
             )
 
         return metrics
+    
+    def generate_comparison_plots(
+        self,
+        other_results: dict = None,
+        save_dir: str = None,
+        prediction_column: str = 'average_needle_heatmap_value',
+    ):
+        """
+        Generate comparison plots from collected results.
+        
+        This method creates publication-quality plots comparing models:
+        - ROC curves with AUC
+        - Sensitivity vs Specificity curves
+        - Precision-Recall curves
+        - Performance at fixed operating points
+        
+        Args:
+            other_results: Dict mapping model name to results_table DataFrames
+                          for other models to compare against
+            save_dir: Directory to save plots (None = don't save)
+            prediction_column: Column name for predictions (default: heatmap)
+            
+        Returns:
+            Dictionary of figure objects
+            
+        Example:
+            evaluator.generate_comparison_plots(
+                other_results={
+                    'Baseline': baseline_results_table,
+                    'Supervised': supervised_results_table,
+                },
+                save_dir='comparison_plots/'
+            )
+        """
+        try:
+            from src.model_comparison_plots import ModelComparisonPlotter
+        except ImportError:
+            print("Warning: model_comparison_plots module not found. Skipping comparison plots.")
+            return {}
+        
+        if self.results_table is None:
+            print("Warning: No results collected yet. Call aggregate_metrics() first.")
+            return {}
+        
+        plotter = ModelComparisonPlotter()
+        
+        # Add current model
+        preds = self.results_table[prediction_column].values
+        labels = self.results_table['label'].values
+        plotter.add_model('Current Model', preds, labels)
+        
+        # Add other models if provided
+        if other_results:
+            for name, results_table in other_results.items():
+                other_preds = results_table[prediction_column].values
+                other_labels = results_table['label'].values
+                plotter.add_model(name, other_preds, other_labels)
+        
+        # Generate and optionally save plots
+        figures = plotter.generate_all_plots(save_dir=save_dir)
+        
+        # Also generate combined figure
+        combined_fig = plotter.generate_combined_figure(
+            save_path=f'{save_dir}/combined_comparison.png' if save_dir else None
+        )
+        figures['combined'] = combined_fig
+        
+        return figures
 

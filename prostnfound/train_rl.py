@@ -130,7 +130,18 @@ def main(cfg):
     is_rl_model = isinstance(model, ProstNFoundRL) or (ProstNFoundRLV2 is not None and isinstance(model, ProstNFoundRLV2))
     logging.info(f"Is RL model: {is_rl_model}")
     
-    model = ProstNFoundMeta(model, **cfg.get('metamodel', {}), is_rl=is_rl_model)
+    # Get decoder prostate mask constraint settings from config
+    apply_prostate_mask_to_decoder = cfg.get('decoder_prostate_mask_constraint', False)
+    boundary_tolerance_patches = cfg.model_kw.get('boundary_tolerance_patches', 0)
+    
+    model = ProstNFoundMeta(
+        model, 
+        **cfg.get('metamodel', {}), 
+        is_rl=is_rl_model,
+        apply_prostate_mask_to_decoder=apply_prostate_mask_to_decoder,
+        boundary_tolerance_patches=boundary_tolerance_patches,
+    )
+
 
     model.to(cfg.device)
     if cfg.get('torch_compile', False):
@@ -236,14 +247,36 @@ def main(cfg):
                     policy="now",
                 )
 
+    # Phased training: Supervised warmup followed by RL fine-tuning
+    # This mimics RLHF approach - supervised pre-training then RL
+    rl_supervised_warmup_epochs = cfg.get('rl_supervised_warmup_epochs', 0)
+    if rl_supervised_warmup_epochs > 0 and use_rl and is_rl_model:
+        logging.info(f"=== PHASED TRAINING MODE ===")
+        logging.info(f"Phase 1: Supervised warmup for {rl_supervised_warmup_epochs} epochs")
+        logging.info(f"Phase 2: RL fine-tuning for {cfg.epochs - rl_supervised_warmup_epochs} epochs")
+    
     for epoch in range(epoch, cfg.epochs):
         if cfg.cutoff_epoch is not None and epoch > cfg.cutoff_epoch:
             break
-        logging.info(f"Epoch {epoch}")
+        
+        # Determine if we're in supervised warmup phase or RL phase
+        in_supervised_warmup = epoch < rl_supervised_warmup_epochs
+        use_rl_this_epoch = use_rl and is_rl_model and not in_supervised_warmup
+        
+        # Log phase transition
+        if epoch == rl_supervised_warmup_epochs and rl_supervised_warmup_epochs > 0 and use_rl and is_rl_model:
+            logging.info(f"=== SWITCHING TO RL FINE-TUNING (Epoch {epoch}) ===")
+        
+        if in_supervised_warmup:
+            logging.info(f"Epoch {epoch} [SUPERVISED WARMUP Phase - {epoch + 1}/{rl_supervised_warmup_epochs}]")
+        elif use_rl_this_epoch:
+            logging.info(f"Epoch {epoch} [RL FINE-TUNING Phase - {epoch - rl_supervised_warmup_epochs + 1}/{cfg.epochs - rl_supervised_warmup_epochs}]")
+        else:
+            logging.info(f"Epoch {epoch}")
 
         save_checkpoint("experiment_state_rl.pth")
 
-        if use_rl and is_rl_model:
+        if use_rl_this_epoch:
             run_rl_train_epoch_batched(
                 cfg,
                 model,
@@ -702,6 +735,12 @@ def setup_optimizer(args, model, train_loader):
     warmup_epochs = 5
     niter_per_ep = len(train_loader)
     warmup_lr_factor = args.get('warmup_lr', 0.0001) / args.lr
+    
+    # Phased training support: supervised warmup + RL fine-tuning
+    rl_supervised_warmup_epochs = args.get('rl_supervised_warmup_epochs', 0)
+    rl_lr_restart = args.get('rl_lr_restart', False)  # Restart LR when switching to RL
+    rl_lr_factor = args.get('rl_lr_factor', 1.0)  # Optional: scale LR during RL phase
+    
     params = [
         {"params": encoder_parameters, "lr": args.get('encoder_lr', 1e-5)},
         {"params": warmup_parameters, "lr": args.lr},
@@ -713,6 +752,32 @@ def setup_optimizer(args, model, train_loader):
         if schedule == 'constant': 
             return 1
 
+        # Determine which phase we're in
+        current_epoch = iter // niter_per_ep
+        in_rl_phase = current_epoch >= rl_supervised_warmup_epochs and rl_supervised_warmup_epochs > 0
+        
+        # If rl_lr_restart is enabled and we're in RL phase, restart the schedule
+        if rl_lr_restart and in_rl_phase:
+            # Recalculate iter relative to RL phase start
+            rl_phase_start_iter = rl_supervised_warmup_epochs * niter_per_ep
+            iter_in_rl_phase = iter - rl_phase_start_iter
+            rl_phase_epochs = total_epochs - rl_supervised_warmup_epochs
+            
+            # Apply RL-phase-specific warmup (2 epochs) then cosine decay
+            rl_warmup_epochs = min(2, rl_phase_epochs // 4)  # Shorter warmup for RL
+            
+            if iter_in_rl_phase < rl_warmup_epochs * niter_per_ep:
+                # Linear warmup within RL phase
+                multiplier = iter_in_rl_phase / (rl_warmup_epochs * niter_per_ep)
+            else:
+                # Cosine decay for rest of RL phase
+                cur_iter = iter_in_rl_phase - rl_warmup_epochs * niter_per_ep
+                total_decay_iter = (rl_phase_epochs - rl_warmup_epochs) * niter_per_ep
+                multiplier = 0.5 * (1 + np.cos(np.pi * cur_iter / total_decay_iter))
+            
+            return multiplier * rl_lr_factor
+
+        # Original schedule for supervised phase (or if rl_lr_restart is False)
         if iter < encoder_frozen_epochs * niter_per_ep:
             if is_encoder_or_cnn:
                 return 0
@@ -765,11 +830,20 @@ def setup_optimizer(args, model, train_loader):
 class ProstNFoundMeta(nn.Module):
     """Wraps a model to perform forward pass with ProstNFound style training"""
 
-    def __init__(self, model: nn.Module, mask_output_key=None, is_rl=False):
+    def __init__(
+        self, 
+        model: nn.Module, 
+        mask_output_key=None, 
+        is_rl=False,
+        apply_prostate_mask_to_decoder=False,
+        boundary_tolerance_patches=0,
+    ):
         super().__init__()
         self.model = model
         self.mask_output_key = mask_output_key
         self.is_rl = is_rl
+        self.apply_prostate_mask_to_decoder = apply_prostate_mask_to_decoder
+        self.boundary_tolerance_patches = boundary_tolerance_patches
 
         if isinstance(self.model, ProstNFound):
             logging.info(f"Model ProstNFound with prompts {self.model.prompts}")
@@ -777,9 +851,19 @@ class ProstNFoundMeta(nn.Module):
             logging.info(f"Model ProstNFoundRL with prompts {self.model.prompts}")
         elif ProstNFoundRLV2 is not None and isinstance(self.model, ProstNFoundRLV2):
             logging.info(f"Model ProstNFoundRLV2 with prompts {self.model.prompts}")
+        
+        if self.apply_prostate_mask_to_decoder:
+            logging.info(
+                f"Decoder prostate mask constraint ENABLED\n"
+                f"  - Boundary tolerance: {boundary_tolerance_patches} patches on 16x16 feature grid\n"
+                f"  - Will be scaled to decoder output resolution (typically 64x64 = 4x scale)\n"
+                f"  - Uses same dilation approach as RL attention (conv2d)"
+            )
+
 
         self.register_buffer("temperature", torch.tensor([1.0]))
         self.register_buffer("bias", torch.tensor([0.0]))
+
 
     @property
     def device(self):
@@ -850,18 +934,74 @@ class ProstNFoundMeta(nn.Module):
             cancer_logits / self.temperature[None, None, None, :]
             + self.bias[None, None, None, :]
         )
+        
+        # Apply prostate mask constraint to decoder output (hard mask)
+        # This matches the RL attention constraint approach
+        if self.apply_prostate_mask_to_decoder:
+            # Resize prostate mask to match cancer_logits if needed
+            _, _, H_logits, W_logits = cancer_logits.shape
+            _, _, H_mask, W_mask = prostate_mask.shape
+            
+            if (H_mask, W_mask) != (H_logits, W_logits):
+                prostate_mask_for_constraint = F.interpolate(
+                    prostate_mask.float(),
+                    size=(H_logits, W_logits),
+                    mode='nearest'
+                )
+            else:
+                prostate_mask_for_constraint = prostate_mask.float()
+            
+            # Apply boundary tolerance with proper scaling
+            # RL attention operates on 16x16 feature grid
+            # Decoder typically outputs at 64x64 (mask_size from config)
+            # So we need to scale: boundary_tolerance_pixels = boundary_tolerance_patches * (H_logits / 16)
+            if self.boundary_tolerance_patches > 0:
+                # Calculate scale factor from feature grid to decoder output
+                # Feature grid is always 16x16, decoder output is H_logits x W_logits
+                scale_factor = H_logits // 16
+                boundary_tolerance_pixels = self.boundary_tolerance_patches * scale_factor
+                
+                # Use conv2d for dilation (matches RL attention approach EXACTLY)
+                kernel_size = 2 * boundary_tolerance_pixels + 1
+                dilation_kernel = torch.ones(
+                    1, 1, kernel_size, kernel_size,
+                    device=prostate_mask_for_constraint.device
+                )
+                prostate_mask_for_constraint = F.conv2d(
+                    prostate_mask_for_constraint,
+                    dilation_kernel,
+                    padding=boundary_tolerance_pixels
+                )
+                prostate_mask_for_constraint = (prostate_mask_for_constraint > 0).float()
+            
+            # Create mask for outside prostate regions
+            outside_mask = prostate_mask_for_constraint < 0.5
+            
+            # Set logits to -100 outside prostate (sigmoid(-100) ≈ 0)
+            # This matches the RL attention constraint: logits set to -inf → softmax gives 0
+            # For decoder: logits set to -100 → sigmoid gives ~0
+            cancer_logits = torch.where(
+                outside_mask.expand_as(cancer_logits),
+                torch.full_like(cancer_logits, -100.0),
+                cancer_logits
+            )
+        
         data["cancer_logits"] = cancer_logits
 
         # compute predictions
         masks = (prostate_mask > 0.5) & (needle_mask > 0.5)
         predictions, batch_idx = MaskedPredictionModule()(cancer_logits, masks)
         mean_predictions_in_needle = []
+        thresholded_involvement = []
         for j in range(B):
-            mean_predictions_in_needle.append(
-                predictions[batch_idx == j].sigmoid().mean()
-            )
+            probs = predictions[batch_idx == j].sigmoid()
+            mean_predictions_in_needle.append(probs.mean())
+            # Thresholded involvement: fraction of needle pixels with prob > 0.5
+            thresholded_involvement.append((probs > 0.5).float().mean())
         mean_predictions_in_needle = torch.stack(mean_predictions_in_needle)
+        thresholded_involvement = torch.stack(thresholded_involvement)
         data["average_needle_heatmap_value"] = mean_predictions_in_needle
+        data["thresholded_needle_involvement"] = thresholded_involvement
 
         prostate_masks = prostate_mask > 0.5
         predictions, batch_idx = MaskedPredictionModule()(cancer_logits, prostate_masks)

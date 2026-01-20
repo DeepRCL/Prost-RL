@@ -495,6 +495,18 @@ class ProstNFoundMeta(nn.Module):
         mean_predictions_in_prostate = torch.stack(mean_predictions_in_prostate)
         data["average_prostate_heatmap_value"] = mean_predictions_in_prostate
 
+        # Compute thresholded needle involvement (fraction of pixels > 0.5)
+        masks = (prostate_mask > 0.5) & (needle_mask > 0.5)
+        predictions, batch_idx = MaskedPredictionModule()(cancer_logits, masks)
+        thresholded_predictions_in_needle = []
+        for j in range(B):
+            needle_probs = predictions[batch_idx == j].sigmoid()
+            # Fraction of needle pixels with prob > 0.5
+            thresholded_fraction = (needle_probs > 0.5).float().mean()
+            thresholded_predictions_in_needle.append(thresholded_fraction)
+        thresholded_predictions_in_needle = torch.stack(thresholded_predictions_in_needle)
+        data["thresholded_needle_involvement"] = thresholded_predictions_in_needle
+
         if include_postprocessed_heatmaps: 
             cancer_logits = data["cancer_logits"]
             heatmap = cancer_logits[0, 0].detach().sigmoid().cpu().numpy()

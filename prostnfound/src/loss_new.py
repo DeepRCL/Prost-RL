@@ -288,6 +288,13 @@ class SumLoss(nn.Module):
 
 
 class OutsideProstatePenaltyLoss(nn.Module):
+    """
+    Soft penalty for decoder predictions outside prostate.
+    
+    NOTE: This is a SOFT constraint - it penalizes but doesn't prevent
+    predictions outside prostate. For a HARD constraint matching the 
+    RL attention mask, use DecoderProstateMaskConstraint instead.
+    """
 
     def forward(self, data: dict):
         cancer_logits = data["cancer_logits"]
@@ -307,6 +314,111 @@ class OutsideProstatePenaltyLoss(nn.Module):
         loss = torch.nn.L1Loss()(predictions, torch.zeros_like(predictions))
 
         return loss
+
+
+class DecoderProstateMaskConstraint(nn.Module):
+    """
+    HARD mask constraint for decoder predictions outside prostate.
+    
+    This matches the RL attention constraint approach:
+    - RL attention: Sets logits to -inf → softmax gives 0
+    - Decoder: Sets logits to large negative value → sigmoid gives ~0
+    
+    Unlike OutsideProstatePenaltyLoss which adds a soft L1 penalty,
+    this class directly zeroes out logits outside the prostate,
+    making predictions literally impossible outside prostate.
+    
+    Args:
+        boundary_tolerance_pixels: Dilation radius for boundary tolerance (default: 0)
+        negative_value: Large negative value to set outside prostate (default: -100)
+    """
+    
+    def __init__(
+        self, 
+        boundary_tolerance_pixels: int = 0,
+        negative_value: float = -100.0,
+    ):
+        super().__init__()
+        self.boundary_tolerance_pixels = boundary_tolerance_pixels
+        self.negative_value = negative_value
+    
+    def forward(self, data: dict) -> dict:
+        """
+        Apply hard mask to cancer_logits in place.
+        
+        Modifies data["cancer_logits"] to have large negative values
+        outside the prostate mask, so sigmoid gives ~0.
+        
+        Returns:
+            Modified data dict with masked cancer_logits
+        """
+        cancer_logits = data["cancer_logits"]
+        prostate_mask = data["prostate_mask"].to(cancer_logits.device)
+        
+        B, C, H, W = cancer_logits.shape
+        
+        # Resize prostate mask to match logits if needed
+        if prostate_mask.shape[-2:] != (H, W):
+            prostate_mask = F.interpolate(
+                prostate_mask.float(),
+                size=(H, W),
+                mode='nearest'
+            )
+        
+        # Apply dilation for boundary tolerance if specified
+        if self.boundary_tolerance_pixels > 0:
+            kernel_size = 2 * self.boundary_tolerance_pixels + 1
+            dilation_kernel = torch.ones(
+                1, 1, kernel_size, kernel_size, 
+                device=prostate_mask.device
+            )
+            prostate_mask = F.conv2d(
+                prostate_mask,
+                dilation_kernel,
+                padding=self.boundary_tolerance_pixels
+            )
+            prostate_mask = (prostate_mask > 0).float()
+        
+        # Create mask for outside prostate (where mask < 0.5)
+        outside_mask = prostate_mask < 0.5  # (B, 1, H, W)
+        
+        # Apply hard constraint: set logits to large negative value outside prostate
+        # This makes sigmoid(logits) ≈ 0 outside prostate
+        cancer_logits = torch.where(
+            outside_mask.expand_as(cancer_logits),
+            torch.full_like(cancer_logits, self.negative_value),
+            cancer_logits
+        )
+        
+        data["cancer_logits"] = cancer_logits
+        
+        return data
+
+
+class DecoderProstateMaskLoss(nn.Module):
+    """
+    Wrapper that applies hard prostate mask constraint and then computes loss.
+    
+    This ensures the decoder predictions are hard-masked before any loss computation,
+    matching the RL attention constraint approach.
+    """
+    
+    def __init__(
+        self,
+        base_loss: nn.Module,
+        boundary_tolerance_pixels: int = 0,
+    ):
+        super().__init__()
+        self.mask_constraint = DecoderProstateMaskConstraint(
+            boundary_tolerance_pixels=boundary_tolerance_pixels
+        )
+        self.base_loss = base_loss
+    
+    def forward(self, data: dict):
+        # Apply hard mask constraint first
+        data = self.mask_constraint(data)
+        # Then compute loss with masked logits
+        return self.base_loss(data)
 
 
 def build_heatmap_loss(args):
@@ -344,6 +456,11 @@ def build_loss(args):
     hmap_loss = build_heatmap_loss(args)
 
     if hmap_loss is not None:
+        # NOTE: Decoder prostate mask constraint is now applied in train_rl.py
+        # (ProstNFoundMeta.forward) to avoid double masking.
+        # The constraint uses the same boundary tolerance as RL attention.
+        if args.get('decoder_prostate_mask_constraint', False):
+            print("Decoder prostate mask constraint enabled (applied in forward pass, not loss).")
         losses.append(hmap_loss)
 
     if args.add_image_clf:
@@ -351,11 +468,18 @@ def build_loss(args):
         class_weight = args.get('image_clf_class_weight', 'balanced')
         losses.append(ImageLevelClassificationLoss(mode=args.image_clf_mode, class_weight=class_weight))
 
+    # SOFT penalty (legacy approach - NOT recommended for consistency with RL)
     if args.outside_prostate_penalty:
-        print("Adding outside prostate penalty loss.")
-        losses.append(OutsideProstatePenaltyLoss())
+        if args.get('decoder_prostate_mask_constraint', False):
+            print("Warning: Both outside_prostate_penalty and decoder_prostate_mask_constraint enabled.")
+            print("         The hard mask constraint is already applied. Soft penalty is redundant.")
+        else:
+            print("Adding outside prostate penalty loss (SOFT constraint).")
+            print("         Consider using decoder_prostate_mask_constraint=true for HARD constraint matching RL.")
+            losses.append(OutsideProstatePenaltyLoss())
 
     return SumLoss(losses)
+
 
 
 def get_parser():

@@ -130,7 +130,12 @@ def main(args):
     print(f"Model type: {type(base_model)}")
     print(f"Is RL model: {is_rl_model}")
     
-    model = ProstNFoundMeta(base_model, is_rl=is_rl_model)
+    model = ProstNFoundMeta(
+        base_model, 
+        is_rl=is_rl_model,
+        apply_prostate_mask_to_decoder=args.get('apply_prostate_mask_to_decoder', True),
+        boundary_tolerance_patches=args.get('boundary_tolerance_patches', 0)
+    )
     print(model.load_state_dict(state["model"], strict=False))
     model.to(device)
     model.eval()
@@ -191,6 +196,53 @@ def main(args):
                     data = model(data, deterministic=True)
                 else:
                     data = model(data)
+        
+        # Debug: Check if thresholded metric is being calculated (first batch only)
+        if i == 0:
+            if 'thresholded_needle_involvement' in data:
+                print(f"✓ Thresholded involvement metric found in data (sample value: {data['thresholded_needle_involvement'][0].item():.3f})")
+            else:
+                print(f"✗ WARNING: 'thresholded_needle_involvement' not in data! Available keys: {list(data.keys())}")
+
+        # Apply prostate mask constraint to decoder output (if configured)
+        # This sets logits to -100 outside prostate → sigmoid ≈ 0
+        if args.get('apply_prostate_mask_to_decoder', True) and 'cancer_logits' in data and 'prostate_mask' in data:
+            import torch.nn.functional as F
+            cancer_logits = data['cancer_logits']
+            prostate_mask = data['prostate_mask'].to(cancer_logits.device)  # Ensure same device
+            
+            # Resize prostate mask to match cancer_logits if needed
+            if prostate_mask.shape[-2:] != cancer_logits.shape[-2:]:
+                prostate_mask_resized = F.interpolate(
+                    prostate_mask.float(),
+                    size=cancer_logits.shape[-2:],
+                    mode='nearest'
+                )
+            else:
+                prostate_mask_resized = prostate_mask.float()
+            
+            # Apply optional dilation for boundary tolerance (in patches, matching RL)
+            # Fetch from model_kw if not in main args
+            boundary_tolerance = args.get('boundary_tolerance_patches', args.model_kw.get('boundary_tolerance_patches', 0))
+            if boundary_tolerance > 0:
+                kernel_size = 2 * boundary_tolerance + 1
+                # Use max_pool2d for efficient dilation on the patch grid
+                prostate_mask_resized = F.max_pool2d(
+                    prostate_mask_resized,
+                    kernel_size=kernel_size,
+                    stride=1,
+                    padding=boundary_tolerance
+                )
+            
+            # Create mask for outside prostate regions
+            outside_mask = prostate_mask_resized < 0.5
+            
+            # Set logits to -100 outside prostate (sigmoid(-100) ≈ 0)
+            data['cancer_logits'] = torch.where(
+                outside_mask.expand_as(cancer_logits),
+                torch.tensor(-100.0, device=cancer_logits.device, dtype=cancer_logits.dtype),
+                cancer_logits
+            )
 
         if args.postprocess:
             cancer_logits = data.pop("cancer_logits")

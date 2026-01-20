@@ -1,7 +1,7 @@
-# ProstNFound-RL V2 - Continuous Patch Attention
-# Uses full attention heatmap for decoder conditioning
+# ProstNFound-RL V2 - Continuous Patch Attention with PPO
+# Uses full attention heatmap for decoder conditioning with PPO algorithm
 
-name: "PNF-RL-V2-continuous-classification_only-GRPO-BalancedLoss-Softmask-decoder"
+name: "PPO-ROI-Only"
 
 data:
  fold: 0
@@ -39,47 +39,47 @@ model_kw:
  freeze_prostnfound: false
  use_prostate_mask_constraint: true
  discrete_attention: false  # Continuous attention
- use_value_function: false
+ use_value_function: true  # PPO requires value function
  upsample: false
  boundary_tolerance_patches: 1
 
 # Loss configuration
 loss: mil_prop_bce_entropy_reg
-# Use HARD mask constraint for decoder (matches RL attention constraint)
-# This sets decoder logits to -100 outside prostate (sigmoid → ~0)
-decoder_prostate_mask_constraint: true
-outside_prostate_penalty: false  # Disabled - using hard constraint instead (this is soft L1 penalty)
 add_image_clf: true
 image_clf_mode: cspca
 image_clf_class_weight: balanced  # Automatically balance classes to handle dataset imbalance
 
 # RL configuration
 use_rl: true
-rl_mode: grpo
+rl_mode: ppo  # Changed from grpo to ppo
+
+# Use HARD mask constraint for decoder (matches RL attention constraint)
+# This sets decoder logits to -100 outside prostate (sigmoid → ~0)
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false  # Disabled - using hard constraint instead (this is soft L1 penalty)
 
 # Reward configuration
-rl_reward_mode: classification_only
+rl_reward_mode: roi_only
  # Options:
  # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
- # - 'classification_only': Only classification head performance
- # - 'classification_gated_needle': Only reward if cls correct + needle attention ~ involvement (NEW)
- # - 'attention_proportional': Reward attention proportional to true involvement
- # - 'roi_only': Only ROI/heatmap involvement accuracy
  # - 'confidence_based': Reward high confidence on correct predictions
+ # - 'classification_only': Only classification head performance
+ # - 'roi_only': Only ROI/heatmap involvement accuracy
  # - 'loss_based': Negative BCE loss (legacy, not recommended)
 rl_cspca_bonus: 2
 
-# Within-image comparison
+# PPO-specific: samples per image for policy updates
 rl_num_samples_per_image: 4
 
-# GRPO hyperparameters
-rl_num_update_epochs: 2
-rl_clip_eps: 0.1
-rl_entropy_coef: 0.005
-rl_kl_coef: 0.01
-rl_max_grad_norm: 0.25
-rl_loss_weight: 0.8
-rl_value_coef: 0.5
+# PPO hyperparameters
+
+rl_num_update_epochs: 4  # PPO typically uses more update epochs than GRPO
+rl_clip_eps: 0.2  # Standard PPO clipping parameter
+rl_entropy_coef: 0.01  # Encourage exploration
+rl_kl_coef: 0.0  # Not typically used in PPO (used in PPO-KL variant)
+rl_max_grad_norm: 0.6  # Gradient clipping for stability
+rl_loss_weight: 1.0  # Weight for RL loss component
+rl_value_coef: 0.5  # Value function loss coefficient
 
 # Benign Sparsity Penalty (NEW)
 # Penalizes high attention activation in benign cases (involvement=0)

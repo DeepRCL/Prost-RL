@@ -1,7 +1,20 @@
-# ProstNFound-RL V2 - Continuous Patch Attention with PPO
-# Uses full attention heatmap for decoder conditioning with PPO algorithm
+# ProstNFound-RL V2 - PHASED TRAINING (Supervised Warmup + PPO Fine-tuning)
+# 
+# This config implements the RLHF-style training approach:
+# Phase 1 (Supervised): Train with standard supervised loss for warmup epochs
+#                       This establishes a good baseline attention mechanism
+# Phase 2 (RL Fine-tuning): Then switch to PPO training to refine the policy
+#
+# This approach mimics how language models are trained:
+# 1. Pre-training on supervised data (SFT - Supervised Fine-Tuning)
+# 2. Then RL fine-tuning (RLHF - Reinforcement Learning from Human Feedback)
+#
+# Expected benefits:
+# - Phase 1 gives stable initial attention patterns
+# - Phase 2 refines the policy for better exploration/exploitation
+# - Should exceed performance of either supervised-only or RL-from-scratch
 
-name: "PPO-maskdecoding-8samples"
+name: "PPO-PHASED-supv-rl-5"
 
 data:
  fold: 0
@@ -51,7 +64,26 @@ image_clf_class_weight: balanced  # Automatically balance classes to handle data
 
 # RL configuration
 use_rl: true
-rl_mode: ppo  # Changed from grpo to ppo
+rl_mode: ppo
+
+# =============================================================================
+# PHASED TRAINING CONFIGURATION (NEW!)
+# =============================================================================
+# Number of epochs to train with SUPERVISED ONLY before switching to RL
+# During these epochs, the model trains like standard supervised learning
+# This gives a stable baseline before RL fine-tuning kicks in
+rl_supervised_warmup_epochs: 5  # Phase 1: 5 epochs supervised warmup
+
+# LR RESTART: When switching to RL, restart the learning rate schedule
+# This is critical! Otherwise LR is already low when RL starts
+# With rl_lr_restart: true, the LR will:
+#   - Phase 1 (epochs 0-4): Normal cosine schedule for supervised
+#   - Phase 2 (epoch 5+): RESTART with 2-epoch warmup -> cosine decay for RL
+rl_lr_restart: true  # Restart LR schedule when switching to RL phase
+
+# Optional: Scale the LR during RL phase (e.g., 0.5 = half the LR)
+# RL often benefits from slightly lower LR than supervised for stability
+rl_lr_factor: 0.8  # Use 50% of base LR during RL phase (recommended for stability)
 
 # Use HARD mask constraint for decoder (matches RL attention constraint)
 # This sets decoder logits to -100 outside prostate (sigmoid → ~0)
@@ -69,33 +101,35 @@ rl_reward_mode: classification_only
 rl_cspca_bonus: 2
 
 # PPO-specific: samples per image for policy updates
-rl_num_samples_per_image: 8
+rl_num_samples_per_image: 8  # Higher for better gradient estimates
 
 # PPO hyperparameters
-
-rl_num_update_epochs: 6  # PPO typically uses more update epochs than GRPO
+rl_num_update_epochs: 4  # PPO typically uses more update epochs than GRPO
 rl_clip_eps: 0.2  # Standard PPO clipping parameter
-rl_entropy_coef: 0.02  # Encourage exploration
+rl_entropy_coef: 0.06  # Encourage exploration (slightly higher for phased training)
 rl_kl_coef: 0.0  # Not typically used in PPO (used in PPO-KL variant)
-rl_max_grad_norm: 0.8  # Gradient clipping for stability
+rl_max_grad_norm: 0.6  # Gradient clipping for stability
 rl_loss_weight: 1.0  # Weight for RL loss component
 rl_value_coef: 0.5  # Value function loss coefficient
 
-# Benign Sparsity Penalty (NEW)
+# Benign Sparsity Penalty
 # Penalizes high attention activation in benign cases (involvement=0)
 # This encourages the RL agent to produce sparse/low attention for non-cancer samples
 # Set to 0.0 to disable, try 0.3-1.0 to enable
 rl_benign_sparsity_penalty_weight: 0.0
 
 # Optimizer configuration
+# NOTE: Learning rate schedule spans total epochs (40) including warmup
+# During supervised warmup, this provides stable gradients
+# After switching to RL, lr will be lower (cosine decay) which helps stability
 optimizer: adamw
 lr: 2.0e-05
 encoder_lr: 8.0e-06
 warmup_lr: 5.0e-05
 cnn_lr: 1.0e-05
-warmup_epochs: 1
+warmup_epochs: 1 # LR warmup (separate from supervised warmup)
 wd: 0.01
-epochs: 40
+epochs: 30  # Total epochs: 5 supervised + 35 RL
 accumulate_grad_steps: 1
 cutoff_epoch: null
 scheduler: cosine

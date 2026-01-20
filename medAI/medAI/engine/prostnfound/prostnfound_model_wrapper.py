@@ -83,6 +83,16 @@ class ProstNFoundWrapperForHeatmapModel(ProstNFoundModelInterface):
         mean_predictions_in_needle = torch.stack(mean_predictions_in_needle)
         data["average_needle_heatmap_value"] = mean_predictions_in_needle
 
+        # Compute thresholded involvement (binary activations > 0.5)
+        thresholded_involvement = []
+        for j in range(B):
+            probs = predictions[batch_idx == j].sigmoid()
+            thresholded_involvement.append(
+                (probs > 0.5).float().mean()
+            )
+        thresholded_involvement = torch.stack(thresholded_involvement)
+        data["thresholded_needle_involvement"] = thresholded_involvement
+
         prostate_masks = prostate_mask > 0.5
         predictions, batch_idx = MaskedPredictionModule()(cancer_logits, prostate_masks)
         mean_predictions_in_prostate = []
@@ -186,6 +196,16 @@ class ProstNFoundModelWrapper(ProstNFoundModelInterface):
             )
         mean_predictions_in_needle = torch.stack(mean_predictions_in_needle)
         data["average_needle_heatmap_value"] = mean_predictions_in_needle
+
+        # Compute thresholded involvement (binary activations > 0.5)
+        thresholded_involvement = []
+        for j in range(B):
+            probs = predictions[batch_idx == j].sigmoid()
+            thresholded_involvement.append(
+                (probs > 0.5).float().mean()
+            )
+        thresholded_involvement = torch.stack(thresholded_involvement)
+        data["thresholded_needle_involvement"] = thresholded_involvement
 
         prostate_masks = prostate_mask > 0.5
         predictions, batch_idx = MaskedPredictionModule()(cancer_logits, prostate_masks)

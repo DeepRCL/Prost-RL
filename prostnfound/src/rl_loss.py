@@ -217,13 +217,6 @@ class RLRewardComputer:
             self.classification_reward_weight * cls_reward
         )
         
-        # csPCa bonus
-        if 'grade_group' in data:
-            cspca_mask = data['grade_group'].to(device) > 2
-            if cspca_mask.ndim > 1:
-                cspca_mask = cspca_mask.squeeze(-1)
-            rewards = torch.where(cspca_mask, rewards * self.cspca_bonus, rewards)
-        
         return rewards
     
     def compute_attention_proportional_reward(
@@ -1097,6 +1090,18 @@ class RLRewardComputer:
             else:
                 raise ValueError(f"Unknown reward_mode: {self.reward_mode}")
         
+        # Apply csPCa bonus if enabled and metadata available
+        # This rewards correct identification of high-grade cancer more strongly
+        if self.cspca_bonus != 1.0 and 'grade_group' in data:
+            device = rewards.device
+            cspca_mask = data['grade_group'].to(device) > 2
+            if cspca_mask.ndim > 1:
+                cspca_mask = cspca_mask.squeeze(-1)
+            
+            # Apply bonus to positive rewards
+            # (Scaling positive performance higher than baseline)
+            rewards = torch.where(cspca_mask, rewards * self.cspca_bonus, rewards)
+
         # Apply prostate boundary penalty if enabled
         if self.prostate_boundary_penalty_weight > 0 and 'rl_attention_coords' in outputs:
             rl_coords = outputs['rl_attention_coords']

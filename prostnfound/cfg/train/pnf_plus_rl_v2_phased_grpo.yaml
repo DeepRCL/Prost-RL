@@ -1,7 +1,15 @@
-# ProstNFound-RL V2 - Continuous Patch Attention
-# Uses full attention heatmap for decoder conditioning
+# ProstNFound-RL V2 - PHASED TRAINING (Supervised Warmup + GRPO Fine-tuning)
+# 
+# This config implements the RLHF-style training approach with GRPO:
+# Phase 1 (Supervised): Train with standard supervised loss for warmup epochs
+#                       This establishes a good baseline attention mechanism
+# Phase 2 (RL Fine-tuning): Then switch to GRPO training to refine the policy
+#
+# GRPO vs PPO:
+# - GRPO: No value function, simpler, works well for simpler reward structures
+# - PPO: Value function baseline, can be more stable for complex rewards
 
-name: "PNF-RL-V2-continuous-classification_only-GRPO-BalancedLoss-Softmask-decoder"
+name: "GRPO-PHASED10-suprl30"
 
 data:
  fold: 0
@@ -34,57 +42,53 @@ model_kw:
  prompts: [age, psa, psad, pos]
  use_clinical_in_policy: true
  use_class_decoder: true
- num_attention_patches: 4  # Not used in continuous mode but kept for compatibility
- policy_hidden_dim: 256
+ num_attention_patches: 4
+ policy_hidden_dim: 512
  freeze_prostnfound: false
  use_prostate_mask_constraint: true
  discrete_attention: false  # Continuous attention
- use_value_function: false
+ use_value_function: false  # GRPO does not use value function
  upsample: false
  boundary_tolerance_patches: 1
 
 # Loss configuration
 loss: mil_prop_bce_entropy_reg
-# Use HARD mask constraint for decoder (matches RL attention constraint)
-# This sets decoder logits to -100 outside prostate (sigmoid → ~0)
-decoder_prostate_mask_constraint: true
-outside_prostate_penalty: false  # Disabled - using hard constraint instead (this is soft L1 penalty)
 add_image_clf: true
 image_clf_mode: cspca
-image_clf_class_weight: balanced  # Automatically balance classes to handle dataset imbalance
+image_clf_class_weight: balanced
 
 # RL configuration
 use_rl: true
-rl_mode: grpo
+rl_mode: grpo  # GRPO instead of PPO
+
+# =============================================================================
+# PHASED TRAINING CONFIGURATION
+# =============================================================================
+rl_supervised_warmup_epochs: 10  # Phase 1: 5 epochs supervised warmup
+rl_lr_restart: true  # Restart LR schedule when switching to RL phase
+rl_lr_factor: 0.5  # Use 50% of base LR during RL phase
+
+# Decoder constraints
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
 
 # Reward configuration
 rl_reward_mode: classification_only
- # Options:
- # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
- # - 'classification_only': Only classification head performance
- # - 'classification_gated_needle': Only reward if cls correct + needle attention ~ involvement (NEW)
- # - 'attention_proportional': Reward attention proportional to true involvement
- # - 'roi_only': Only ROI/heatmap involvement accuracy
- # - 'confidence_based': Reward high confidence on correct predictions
- # - 'loss_based': Negative BCE loss (legacy, not recommended)
 rl_cspca_bonus: 2
 
-# Within-image comparison
-rl_num_samples_per_image: 4
+# GRPO-specific: samples per image
+rl_num_samples_per_image: 8
 
-# GRPO hyperparameters
-rl_num_update_epochs: 2
-rl_clip_eps: 0.1
-rl_entropy_coef: 0.005
-rl_kl_coef: 0.01
-rl_max_grad_norm: 0.25
-rl_loss_weight: 0.8
-rl_value_coef: 0.5
+# GRPO hyperparameters (no value function)
+rl_num_update_epochs: 4  # GRPO typically uses fewer updates
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.04  # Standard entropy for GRPO
+rl_kl_coef: 0.01  # GRPO uses KL penalty
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+# rl_value_coef not used in GRPO
 
-# Benign Sparsity Penalty (NEW)
-# Penalizes high attention activation in benign cases (involvement=0)
-# This encourages the RL agent to produce sparse/low attention for non-cancer samples
-# Set to 0.0 to disable, try 0.3-1.0 to enable
+# Benign Sparsity Penalty
 rl_benign_sparsity_penalty_weight: 0.0
 
 # Optimizer configuration
@@ -95,7 +99,7 @@ warmup_lr: 5.0e-05
 cnn_lr: 1.0e-05
 warmup_epochs: 1
 wd: 0.01
-epochs: 30
+epochs: 40  # Total: 5 supervised + 35 GRPO
 accumulate_grad_steps: 1
 cutoff_epoch: null
 scheduler: cosine

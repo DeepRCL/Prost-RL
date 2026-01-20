@@ -7,7 +7,7 @@
 #
 # Compare this with RL models to see if RL provides any benefit.
 
-name: "PNF-RL-V2-continuous-SUPERVISED-BalancedLoss-noprompts"
+name: "PNF-RL-V3-SUPERVISED-BalancedLoss-maskdecoder"
 
 data:
  fold: 0
@@ -37,7 +37,7 @@ data:
 # Model configuration - SAME as RL version
 model: prostnfound_rl_v2_adapter_medsam_legacy
 model_kw:
- prompts: []
+ prompts: [age, psa, psad, pos]
  use_class_decoder: true
  num_attention_patches: 4
  policy_hidden_dim: 256
@@ -51,13 +51,17 @@ model_kw:
 
 # Loss configuration - SAME as RL version
 loss: mil_prop_bce_entropy_reg
-outside_prostate_penalty: false
 add_image_clf: true
 image_clf_mode: cspca
 image_clf_class_weight: balanced
 
 # RL configuration - DISABLED for supervised training
 use_rl: false
+
+# Use HARD mask constraint for decoder (matches RL attention constraint)
+# This sets decoder logits to -100 outside prostate (sigmoid → ~0)
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false  # Disabled - using hard constraint instead (same as PPO)
 
 # Optimizer configuration - SAME as RL version
 optimizer: adamw
