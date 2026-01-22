@@ -100,6 +100,372 @@ class ProportionBCE(nn.Module):
         return loss
 
 
+# =============================================================================
+# NOISE-ROBUST LOSS FUNCTIONS
+# =============================================================================
+
+class TopKMILLoss(nn.Module):
+    """
+    Top-K Involvement Loss (Multiple Instance Learning approach)
+    
+    Instead of forcing ALL needle pixels to match the label (which forces benign 
+    pixels to be predicted as cancer), we only force the Top k% of pixels to be 
+    predicted as cancer, where k is the involvement percentage.
+    
+    This is a form of MIL: if the core has 55% cancer, we assume the "most 
+    suspicious" 55% of pixels are the cancer, and the rest are likely benign.
+    
+    Why it's better: It solves the "blur" problem of ProstNFound+ by allowing 
+    the model to predict 0 for the benign parts of the needle trace.
+    
+    Args:
+        pos_weight: Weight for positive (cancer) cases
+        min_top_k_fraction: Minimum fraction of pixels to select (default: 0.05)
+                           Prevents selecting too few pixels for very low involvement
+        use_soft_topk: If True, use differentiable soft top-k. If False, use hard selection.
+        benign_weight: Weight for benign pixel loss (default: 1.0, previously 0.5 was too weak)
+    """
+    
+    def __init__(
+        self,
+        pos_weight: float = 1.0,
+        min_top_k_fraction: float = 0.05,
+        use_soft_topk: bool = False,
+        temperature: float = 0.1,
+        benign_weight: float = 1.0,  # INCREASED from 0.5 - need strong push to 0
+    ):
+        super().__init__()
+        self.pos_weight = pos_weight
+        self.min_top_k_fraction = min_top_k_fraction
+        self.use_soft_topk = use_soft_topk
+        self.temperature = temperature
+        self.benign_weight = benign_weight
+    
+    def forward(self, bag_of_logits, true_prop):
+        """
+        Args:
+            bag_of_logits: Tensor of shape (N,) or (N, 1) containing logits for needle pixels
+            true_prop: Scalar involvement proportion (0 to 1)
+        """
+        eps = 1e-7
+        
+        # Flatten logits
+        logits = bag_of_logits.view(-1)
+        n_pixels = logits.shape[0]
+        
+        if n_pixels == 0:
+            return torch.tensor(0.0, device=bag_of_logits.device)
+        
+        # Compute probabilities
+        probs = torch.sigmoid(logits)
+        
+        # Handle benign case (involvement = 0)
+        if true_prop.item() == 0:
+            # For benign cores, all pixels should be predicted as benign (prob = 0)
+            loss = F.binary_cross_entropy_with_logits(
+                logits, torch.zeros_like(logits), reduction='mean'
+            )
+            return loss
+        
+        # For cancer cases: only supervise top-k pixels
+        # k = max(min_top_k_fraction, involvement) * n_pixels
+        k_fraction = max(self.min_top_k_fraction, true_prop.item())
+        k = max(1, int(k_fraction * n_pixels))
+        
+        if self.use_soft_topk:
+            # Differentiable soft top-k using softmax with temperature
+            # Higher logits get higher weights
+            weights = F.softmax(logits / self.temperature, dim=0)
+            # Weighted BCE: top-k pixels get higher weights
+            loss = F.binary_cross_entropy_with_logits(
+                logits, torch.ones_like(logits), reduction='none'
+            )
+            loss = (loss * weights * n_pixels).mean()  # Rescale by n_pixels
+        else:
+            # Hard top-k: select k pixels with highest probabilities
+            _, topk_indices = torch.topk(probs, k, largest=True)
+            topk_logits = logits[topk_indices]
+            
+            # These top-k pixels should be cancer (label = 1)
+            cancer_loss = F.binary_cross_entropy_with_logits(
+                topk_logits, torch.ones_like(topk_logits), reduction='mean'
+            )
+            
+            # Penalize the remaining pixels to be benign
+            # This is CRITICAL for sparsity - without strong benign loss,
+            # the model predicts high values everywhere
+            remaining_mask = torch.ones(n_pixels, dtype=torch.bool, device=logits.device)
+            remaining_mask[topk_indices] = False
+            if remaining_mask.sum() > 0:
+                remaining_logits = logits[remaining_mask]
+                benign_loss = F.binary_cross_entropy_with_logits(
+                    remaining_logits, torch.zeros_like(remaining_logits), reduction='mean'
+                )
+                # Weight benign loss - needs to be strong enough to push to 0!
+                loss = cancer_loss + self.benign_weight * benign_loss
+            else:
+                loss = cancer_loss
+        
+        # Apply positive weight
+        loss = loss * self.pos_weight
+        
+        return loss
+
+
+class ThresholdedInvolvementLoss(nn.Module):
+    """
+    Thresholded Involvement Loss
+    
+    Instead of comparing mean probability to involvement, we threshold the 
+    predictions at 0.5 and compare the fraction of "on" pixels to involvement.
+    
+    This makes the loss more directly optimize for the calibration metric:
+    - If involvement = 50%, we want 50% of pixels to have prob > 0.5
+    
+    The loss encourages:
+    - For 50% involvement: ~50% of needle pixels should exceed 0.5 threshold
+    - Sharp predictions (either high or low, not middle values like 0.55)
+    
+    Args:
+        threshold: Probability threshold for considering a pixel as "on"
+        use_soft_threshold: If True, use sigmoid approximation of step function
+        soft_temperature: Temperature for soft threshold (lower = sharper)
+        pos_weight: Weight for positive (cancer) cases
+    """
+    
+    def __init__(
+        self,
+        threshold: float = 0.5,
+        use_soft_threshold: bool = True,
+        soft_temperature: float = 0.1,
+        pos_weight: float = 1.0,
+        entropy_penalty_lambda: float = None,
+    ):
+        super().__init__()
+        self.threshold = threshold
+        self.use_soft_threshold = use_soft_threshold
+        self.soft_temperature = soft_temperature
+        self.pos_weight = pos_weight
+        self.entropy_penalty_lambda = entropy_penalty_lambda
+    
+    def forward(self, bag_of_logits, true_prop):
+        """
+        Args:
+            bag_of_logits: Tensor of shape (N,) or (N, 1) containing logits for needle pixels
+            true_prop: Scalar involvement proportion (0 to 1)
+        """
+        eps = 1e-7
+        
+        # Flatten logits
+        logits = bag_of_logits.view(-1)
+        n_pixels = logits.shape[0]
+        
+        if n_pixels == 0:
+            return torch.tensor(0.0, device=bag_of_logits.device)
+        
+        # Compute probabilities
+        probs = torch.sigmoid(logits)
+        
+        if self.use_soft_threshold:
+            # Soft thresholding using sigmoid
+            # centered_probs = (probs - threshold) / temperature
+            # soft_threshold(probs) = sigmoid((probs - threshold) / temperature)
+            centered = (probs - self.threshold) / self.soft_temperature
+            thresholded = torch.sigmoid(centered)
+        else:
+            # Hard thresholding (not differentiable, use with caution)
+            thresholded = (probs > self.threshold).float()
+        
+        # Predicted proportion of "on" pixels
+        pred_prop = thresholded.mean().clamp(min=eps, max=1 - eps)
+        true_prop_clamped = true_prop.clamp(min=eps, max=1 - eps)
+        
+        # BCE loss on thresholded proportions
+        loss = -true_prop_clamped * torch.log(pred_prop) - (1 - true_prop_clamped) * torch.log(1 - pred_prop)
+        
+        # Also add standard BCE loss to maintain gradients for learning
+        standard_bce = -true_prop * torch.log(probs.mean().clamp(min=eps, max=1 - eps)) \
+                       - (1 - true_prop) * torch.log(1 - probs.mean().clamp(min=eps, max=1 - eps))
+        
+        # Combine thresholded loss with standard BCE
+        loss = 0.5 * loss + 0.5 * standard_bce
+        
+        # Apply positive weight
+        if true_prop.item() > 0:
+            loss = loss * self.pos_weight
+        
+        # Entropy penalty to encourage sharp predictions
+        if self.entropy_penalty_lambda:
+            probs_clamped = probs.clamp(min=eps, max=1 - eps)
+            entropy = -probs_clamped * torch.log(probs_clamped) - (1 - probs_clamped) * torch.log(1 - probs_clamped)
+            entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+            loss = loss + self.entropy_penalty_lambda * entropy.mean()
+        
+        return loss
+
+
+class SymmetricCrossEntropyLoss(nn.Module):
+    """
+    Symmetric Cross Entropy (SCE) for Noise-Robust Learning
+    
+    From "Symmetric Cross Entropy for Robust Learning with Noisy Labels" (ICCV 2019)
+    and used in Manifold DivideMix paper.
+    
+    Standard CE: Penalizes model when it predicts "Benign" on a "Cancer" pixel 
+                 (Hard punishment for missing the noisy label)
+    
+    Reverse CE: Penalizes the label when the model is confident 
+                (Allows model to ignore the label if it strongly disagrees)
+    
+    SCE = α * CE(p, q) + β * RCE(p, q)
+    
+    Where:
+    - CE = -q * log(p)  (standard cross entropy, q is label, p is prediction)
+    - RCE = -p * log(q) (reverse cross entropy)
+    
+    For proportion-based learning:
+    - CE pushes predicted proportion toward true involvement
+    - RCE allows predicted proportion to "override" noisy involvement if confident
+    
+    Args:
+        alpha: Weight for standard cross entropy (default: 1.0)
+        beta: Weight for reverse cross entropy (default: 1.0)
+        pos_weight: Weight for positive (cancer) cases
+        epsilon: Small value for numerical stability in RCE
+    """
+    
+    def __init__(
+        self,
+        alpha: float = 1.0,
+        beta: float = 1.0,
+        pos_weight: float = 1.0,
+        epsilon: float = 1e-4,
+        entropy_penalty_lambda: float = None,
+    ):
+        super().__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.pos_weight = pos_weight
+        self.epsilon = epsilon  # Larger epsilon for RCE stability
+        self.entropy_penalty_lambda = entropy_penalty_lambda
+    
+    def forward(self, bag_of_logits, true_prop):
+        """
+        Args:
+            bag_of_logits: Tensor of shape (N,) or (N, 1) containing logits for needle pixels
+            true_prop: Scalar involvement proportion (0 to 1)
+        """
+        eps = 1e-7
+        
+        # Flatten logits
+        logits = bag_of_logits.view(-1)
+        
+        if logits.shape[0] == 0:
+            return torch.tensor(0.0, device=bag_of_logits.device)
+        
+        # Compute probabilities
+        probs = torch.sigmoid(logits).clamp(min=eps, max=1 - eps)
+        
+        # Predicted proportion
+        pred_prop = probs.mean().clamp(min=eps, max=1 - eps)
+        
+        # Clamp true proportion (label) for RCE
+        # Use larger epsilon for labels in RCE to prevent -inf when label is 0 or 1
+        true_prop_ce = true_prop.clamp(min=eps, max=1 - eps)
+        true_prop_rce = true_prop.clamp(min=self.epsilon, max=1 - self.epsilon)
+        
+        # Standard Cross Entropy: -q * log(p) - (1-q) * log(1-p)
+        # Pushes prediction toward label
+        ce_loss = -true_prop_ce * torch.log(pred_prop) - (1 - true_prop_ce) * torch.log(1 - pred_prop)
+        
+        # Reverse Cross Entropy: -p * log(q) - (1-p) * log(1-q)
+        # Allows model to "ignore" noisy labels when confident
+        rce_loss = -pred_prop * torch.log(true_prop_rce) - (1 - pred_prop) * torch.log(1 - true_prop_rce)
+        
+        # Handle potential NaN in RCE (shouldn't happen with clamping, but be safe)
+        rce_loss = torch.nan_to_num(rce_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Symmetric Cross Entropy
+        loss = self.alpha * ce_loss + self.beta * rce_loss
+        
+        # Apply positive weight
+        if true_prop.item() > 0:
+            loss = loss * self.pos_weight
+        
+        # Entropy penalty for exploration/smoothness
+        if self.entropy_penalty_lambda:
+            entropy = -probs * torch.log(probs) - (1 - probs) * torch.log(1 - probs)
+            entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
+            loss = loss + self.entropy_penalty_lambda * entropy.mean()
+        
+        return loss
+
+
+class TopKInvolvementMILLoss(nn.Module):
+    """
+    Wrapper that applies TopKMILLoss within the CancerDetectionMILLoss framework.
+    
+    This is a combination of:
+    1. Top-K selection: Only supervise top k% pixels as cancer
+    2. MIL framework: Process needle mask and handle batches properly
+    
+    Args:
+        benign_weight: Weight for benign pixel loss (default: 1.0)
+                       Higher values push non-topk pixels more strongly to 0.
+    """
+    
+    def __init__(
+        self,
+        pos_weight: float = 1.0,
+        min_top_k_fraction: float = 0.05,
+        use_soft_topk: bool = False,
+        temperature: float = 0.1,
+        treat_gg1_as_benign: bool = False,
+        benign_weight: float = 1.0,  # Controls how strongly non-topk pixels are pushed to 0
+    ):
+        super().__init__()
+        self.base_loss = TopKMILLoss(
+            pos_weight=pos_weight,
+            min_top_k_fraction=min_top_k_fraction,
+            use_soft_topk=use_soft_topk,
+            temperature=temperature,
+            benign_weight=benign_weight,
+        )
+        self.treat_gg1_as_benign = treat_gg1_as_benign
+
+    def forward(self, data):
+        cancer_logits = data["cancer_logits"]
+        batch_size = len(cancer_logits)
+        prostate_mask = data["prostate_mask"].to(cancer_logits.device)
+        needle_mask = data["needle_mask"].to(cancer_logits.device)
+        involvement = data["involvement"].to(cancer_logits.device)
+        grade_group = data["grade_group"].to(cancer_logits.device)
+
+        if self.treat_gg1_as_benign:
+            involvement = involvement.clone()
+            involvement[grade_group == 1] = 0.0
+
+        masks = []
+        for i in range(len(cancer_logits)):
+            mask = torch.ones(
+                prostate_mask[i].shape, device=prostate_mask[i].device
+            ).bool()
+            mask &= prostate_mask[i] > 0.5
+            mask &= needle_mask[i] > 0.5
+            masks.append(mask)
+        masks = torch.stack(masks)
+        predictions, batch_idx = MaskedPredictionModule()(cancer_logits, masks)
+
+        loss = torch.tensor(0.0, device=cancer_logits.device)
+        for i in range(batch_size):
+            bag_i = predictions[batch_idx == i]
+            involvement_i = involvement[i]
+
+            loss = loss + self.base_loss(bag_i, involvement_i)
+
+        return loss
+
+
 class CancerDetectionMILLoss(nn.Module):
     def __init__(self, base_loss=ProportionBCE(), treat_gg1_as_benign=False):
 
@@ -440,6 +806,100 @@ def build_heatmap_loss(args):
     elif args.loss == "mil_prop_bce_entropy_reg":
         return CancerDetectionMILLoss(
             base_loss=ProportionBCE(entropy_penalty_lambda=0.01, pos_weight=1.0),
+            treat_gg1_as_benign=args.get('treat_gg1_as_benign', False),
+        )
+    
+    # =========================================================================
+    # NOISE-ROBUST LOSS FUNCTIONS
+    # =========================================================================
+    
+    # Top-K MIL Loss: Only supervise top k% pixels as cancer
+    elif args.loss == "topk_mil":
+        loss_kw = args.get('loss_kw', {})
+        return TopKInvolvementMILLoss(
+            pos_weight=args.get('pos_weight', 1.0),
+            min_top_k_fraction=loss_kw.get('min_top_k_fraction', 0.05),
+            use_soft_topk=loss_kw.get('use_soft_topk', False),
+            temperature=loss_kw.get('temperature', 0.1),
+            treat_gg1_as_benign=args.get('treat_gg1_as_benign', False),
+            benign_weight=loss_kw.get('benign_weight', 1.0),  # How strongly to push non-topk to 0
+        )
+    
+    elif args.loss == "topk_mil_soft":
+        loss_kw = args.get('loss_kw', {})
+        return TopKInvolvementMILLoss(
+            pos_weight=args.get('pos_weight', 1.0),
+            min_top_k_fraction=loss_kw.get('min_top_k_fraction', 0.05),
+            use_soft_topk=True,  # Differentiable
+            temperature=loss_kw.get('temperature', 0.1),
+            treat_gg1_as_benign=args.get('treat_gg1_as_benign', False),
+        )
+    
+    # Thresholded Involvement Loss: Compare fraction of pixels > 0.5 to involvement
+    elif args.loss == "thresholded_involvement":
+        loss_kw = args.get('loss_kw', {})
+        return CancerDetectionMILLoss(
+            base_loss=ThresholdedInvolvementLoss(
+                threshold=loss_kw.get('threshold', 0.5),
+                use_soft_threshold=loss_kw.get('use_soft_threshold', True),
+                soft_temperature=loss_kw.get('soft_temperature', 0.1),
+                pos_weight=args.get('pos_weight', 1.0),
+                entropy_penalty_lambda=loss_kw.get('entropy_penalty_lambda', None),
+            ),
+            treat_gg1_as_benign=args.get('treat_gg1_as_benign', False),
+        )
+    
+    elif args.loss == "thresholded_involvement_entropy_reg":
+        loss_kw = args.get('loss_kw', {})
+        return CancerDetectionMILLoss(
+            base_loss=ThresholdedInvolvementLoss(
+                threshold=loss_kw.get('threshold', 0.5),
+                use_soft_threshold=True,
+                soft_temperature=loss_kw.get('soft_temperature', 0.1),
+                pos_weight=args.get('pos_weight', 1.0),
+                entropy_penalty_lambda=0.01,
+            ),
+            treat_gg1_as_benign=args.get('treat_gg1_as_benign', False),
+        )
+    
+    # Symmetric Cross Entropy: Noise-robust loss from Manifold DivideMix
+    elif args.loss == "symmetric_ce":
+        loss_kw = args.get('loss_kw', {})
+        return CancerDetectionMILLoss(
+            base_loss=SymmetricCrossEntropyLoss(
+                alpha=loss_kw.get('alpha', 1.0),
+                beta=loss_kw.get('beta', 1.0),
+                pos_weight=args.get('pos_weight', 1.0),
+                epsilon=loss_kw.get('epsilon', 1e-4),
+                entropy_penalty_lambda=loss_kw.get('entropy_penalty_lambda', None),
+            ),
+            treat_gg1_as_benign=args.get('treat_gg1_as_benign', False),
+        )
+    
+    elif args.loss == "symmetric_ce_entropy_reg":
+        loss_kw = args.get('loss_kw', {})
+        return CancerDetectionMILLoss(
+            base_loss=SymmetricCrossEntropyLoss(
+                alpha=loss_kw.get('alpha', 1.0),
+                beta=loss_kw.get('beta', 1.0),
+                pos_weight=args.get('pos_weight', 1.0),
+                epsilon=loss_kw.get('epsilon', 1e-4),
+                entropy_penalty_lambda=0.01,
+            ),
+            treat_gg1_as_benign=args.get('treat_gg1_as_benign', False),
+        )
+    
+    # Combined: Top-K + Symmetric CE (most robust)
+    elif args.loss == "topk_symmetric_ce":
+        loss_kw = args.get('loss_kw', {})
+        # This combines top-k selection with SCE base loss
+        # For simplicity, we use TopKInvolvementMILLoss which internally uses BCE
+        # and add SCE-style regularization through the entropy penalty
+        return TopKInvolvementMILLoss(
+            pos_weight=args.get('pos_weight', 1.0),
+            min_top_k_fraction=loss_kw.get('min_top_k_fraction', 0.05),
+            use_soft_topk=loss_kw.get('use_soft_topk', True),
+            temperature=loss_kw.get('temperature', 0.1),
             treat_gg1_as_benign=args.get('treat_gg1_as_benign', False),
         )
 

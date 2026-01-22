@@ -1,0 +1,116 @@
+# ProstNFound-RL V2 - NOISE-ROBUST EXPERIMENT: Top-K MIL Loss
+# 
+# Top-K Involvement Loss (Multiple Instance Learning approach)
+# Instead of forcing ALL needle pixels to match the label, we only force 
+# the Top k% of pixels to be predicted as cancer, where k is the involvement %.
+# 
+# WHY: Standard loss forces benign pixels to be predicted as cancer, causing:
+# - "Uniform uncertainty" predictions (~0.55 everywhere)
+# - Poor calibration between activation and true involvement
+#
+# This loss allows benign parts of the needle trace to have low predictions.
+
+name: "V3-PNF-SUPERVISED-TopKMIL"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 16
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# Model configuration - SAME as supervised baseline
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ use_clinical_in_policy: true
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ discrete_attention: false  # Continuous attention
+ use_value_function: false  # Not needed for supervised
+ upsample: false
+ boundary_tolerance_patches: 2
+
+# NOISE-ROBUST LOSS: Top-K MIL
+loss: topk_mil
+loss_kw:
+  min_top_k_fraction: 0.05  # Minimum fraction of pixels to supervise as cancer
+  use_soft_topk: false       # Use hard top-k selection (more interpretable)
+  temperature: 0.1           # Temperature for soft top-k (if enabled)
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# RL configuration - DISABLED for supervised training
+use_rl: false
+
+# Use HARD mask constraint for decoder
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+# Optimizer configuration
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 8.0e-06
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.01
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+scheduler: cosine
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+# Calibration-focused tracking:
+# - val/bal_prop_pred_err: Balanced MAE between heatmap avg and true involvement (lower is better)
+# - val/prop_pred_err_thresholded: MAE of thresholded predictions (lower is better)
+# - val/thresholded_involvement_correlation_spearman: Correlation (higher is better)
+#
+# Classification-focused (original):
+# - val/core_auc_high_involvement: AUROC for high involvement cases
+tracked_metric: val/bal_prop_pred_err
+tracked_metric_mode: min  # Use "min" for error metrics (lower is better)
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

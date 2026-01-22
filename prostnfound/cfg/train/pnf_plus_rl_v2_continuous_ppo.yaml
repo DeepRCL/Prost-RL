@@ -1,7 +1,7 @@
 # ProstNFound-RL V2 - Continuous Patch Attention with PPO
 # Uses full attention heatmap for decoder conditioning with PPO algorithm
 
-name: "PPO-maskdecoding-8samples"
+name: "V3-PPO-detached-roi-only"
 
 data:
  fold: 0
@@ -12,7 +12,7 @@ data:
  undersample_benign_ratio: null
  cohort_selection_mode: kfold
  dataset: default
- batch_size: 16
+ batch_size: 8
  num_workers: 8
  train_subsample_seed: 42
  augmentations: translate
@@ -42,6 +42,11 @@ model_kw:
  use_value_function: true  # PPO requires value function
  upsample: false
  boundary_tolerance_patches: 2
+ # NEW: Detach attention for decoder - when True:
+ # - Policy (attention module) trained ONLY by RL loss
+ # - Decoder trained ONLY by supervised loss
+ # - Clean separation of training signals
+ detach_attention_for_decoder: true  # RECOMMENDED for pure RL evaluation
 
 # Loss configuration
 loss: mil_prop_bce_entropy_reg
@@ -59,7 +64,7 @@ decoder_prostate_mask_constraint: true
 outside_prostate_penalty: false  # Disabled - using hard constraint instead (this is soft L1 penalty)
 
 # Reward configuration
-rl_reward_mode: classification_only
+rl_reward_mode: roi_only
  # Options:
  # - 'combined_v2': Classification + ROI involvement (RECOMMENDED)
  # - 'confidence_based': Reward high confidence on correct predictions
@@ -69,15 +74,15 @@ rl_reward_mode: classification_only
 rl_cspca_bonus: 2
 
 # PPO-specific: samples per image for policy updates
-rl_num_samples_per_image: 8
+rl_num_samples_per_image: 4
 
 # PPO hyperparameters
 
-rl_num_update_epochs: 6  # PPO typically uses more update epochs than GRPO
+rl_num_update_epochs: 4  # PPO typically uses more update epochs than GRPO
 rl_clip_eps: 0.2  # Standard PPO clipping parameter
-rl_entropy_coef: 0.02  # Encourage exploration
+rl_entropy_coef: 0.01  # Encourage exploration
 rl_kl_coef: 0.0  # Not typically used in PPO (used in PPO-KL variant)
-rl_max_grad_norm: 0.8  # Gradient clipping for stability
+rl_max_grad_norm: 0.5  # Gradient clipping for stability
 rl_loss_weight: 1.0  # Weight for RL loss component
 rl_value_coef: 0.5  # Value function loss coefficient
 
@@ -89,13 +94,13 @@ rl_benign_sparsity_penalty_weight: 0.0
 
 # Optimizer configuration
 optimizer: adamw
-lr: 2.0e-05
+lr: 8.0e-05
 encoder_lr: 8.0e-06
 warmup_lr: 5.0e-05
 cnn_lr: 1.0e-05
 warmup_epochs: 1
 wd: 0.01
-epochs: 40
+epochs: 35
 accumulate_grad_steps: 1
 cutoff_epoch: null
 scheduler: cosine

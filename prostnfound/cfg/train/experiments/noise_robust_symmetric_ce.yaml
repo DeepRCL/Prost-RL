@@ -1,0 +1,113 @@
+# ProstNFound-RL V2 - NOISE-ROBUST EXPERIMENT: Symmetric Cross Entropy
+# 
+# Symmetric Cross Entropy (SCE) for Noise-Robust Learning
+# From "Symmetric Cross Entropy for Robust Learning with Noisy Labels" (ICCV 2019)
+# and Manifold DivideMix paper.
+# 
+# SCE = α * CE(p, q) + β * RCE(p, q)
+# - CE: Standard cross entropy - pushes prediction toward label
+# - RCE: Reverse cross entropy - allows model to "override" noisy labels when confident
+#
+# WHY: Your pixel-wise labels are noisy (benign tissues labeled as cancer).
+# Standard CE overfits to this noise. SCE adds "Reverse CE" that prevents
+# the model from over-committing to noisy labels.
+
+name: "PNF-SUPERVISED-SymmetricCE"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 16
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# Model configuration - SAME as supervised baseline
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ use_clinical_in_policy: true
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ discrete_attention: false  # Continuous attention
+ use_value_function: false  # Not needed for supervised
+ upsample: false
+ boundary_tolerance_patches: 2
+
+# NOISE-ROBUST LOSS: Symmetric Cross Entropy with entropy regularization
+loss: symmetric_ce_entropy_reg
+loss_kw:
+  alpha: 1.0     # Weight for standard cross entropy
+  beta: 1.0      # Weight for reverse cross entropy (higher = more noise robust)
+  epsilon: 1e-4  # Large epsilon for RCE stability
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# RL configuration - DISABLED for supervised training
+use_rl: false
+
+# Use HARD mask constraint for decoder
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+# Optimizer configuration
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 8.0e-06
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.01
+epochs: 40
+accumulate_grad_steps: 1
+cutoff_epoch: null
+scheduler: cosine
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+# Calibration-focused tracking (for heatmap calibration experiments)
+# - val/bal_prop_pred_err: Balanced MAE between heatmap avg and true involvement
+tracked_metric: val/bal_prop_pred_err
+tracked_metric_mode: min  # Use "min" for error metrics (lower is better)
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

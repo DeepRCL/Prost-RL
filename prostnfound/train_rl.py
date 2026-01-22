@@ -1,13 +1,17 @@
 """
-Training script for ProstNFound-RL with GRPO
+Training script for ProstNFound-RL with GRPO/GDPO
 
-This is a modified version of train.py that supports RL training with GRPO.
+This is a modified version of train.py that supports RL training with:
+- PPO: Proximal Policy Optimization (with value function)
+- GRPO: Group Relative Policy Optimization (no value function)
+- GDPO: Group reward-Decoupled normalization Policy Optimization (multi-reward)
 
 Key Optimizations (v2):
 1. Batched forward passes: All samples computed in ONE forward pass
 2. Pure GRPO without value function (like Seg-R1)
 3. Group-based advantage normalization within each image
 4. Configurable prostate mask constraint
+5. GDPO for multi-reward training with decoupled normalization
 """
 
 import argparse
@@ -42,6 +46,11 @@ try:
 except ImportError:
     GRPO_V2 = None
     BatchedGRPOTrainerV2 = None
+# Import GDPO for multi-reward decoupled normalization
+try:
+    from medAI.modeling.gdpo import GDPO
+except ImportError:
+    GDPO = None
 from medAI.modeling.setr import SETR
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -180,26 +189,73 @@ def main(cfg):
         # Check if using PPO mode (with value function)
         use_value_function = cfg.model_kw.get('use_value_function', False)
         
-        # Use GRPO_V2 if available, otherwise fall back to GRPO
-        GRPO_class = GRPO_V2 if GRPO_V2 is not None else GRPO
-        logging.info(f"Using {GRPO_class.__name__} for RL training")
+        # Determine RL mode: ppo, grpo, or gdpo
+        rl_mode = cfg.get('rl_mode', 'grpo').lower()
+        logging.info(f"RL mode: {rl_mode.upper()}")
         
-        # Create GRPO (or PPO if value function is enabled)
-        grpo = GRPO_class(
-            clip_eps=cfg.get('rl_clip_eps', 0.2),
-            entropy_coef=cfg.get('rl_entropy_coef', 0.01),
-            kl_coef=cfg.get('rl_kl_coef', 0.01),
-            max_grad_norm=cfg.get('rl_max_grad_norm', 0.5),
-            normalize_advantages=cfg.get('rl_normalize_advantages', True),
-            num_samples_per_image=num_samples_per_image,
-            use_value_function=use_value_function,
-            value_coef=cfg.get('rl_value_coef', 0.5),
-        )
+        if rl_mode == 'gdpo':
+            # GDPO: Group reward-Decoupled normalization Policy Optimization
+            if GDPO is None:
+                raise ImportError("GDPO not available. Please check medAI.modeling.gdpo import.")
+            
+            logging.info("=" * 60)
+            logging.info("GDPO MODE ENABLED - Multi-reward Decoupled Normalization")
+            logging.info("=" * 60)
+            logging.info("GDPO normalizes each reward signal SEPARATELY before combining.")
+            logging.info("This prevents reward advantages collapse in multi-reward training.")
+            
+            # GDPO-specific: reward weights for each component
+            gdpo_reward_weights = cfg.get('gdpo_reward_weights', [1.0, 1.0])
+            gdpo_strict_mode = cfg.get('gdpo_strict_mode', True)  # Strict by default
+            
+            logging.info(f"  Reward weights: {gdpo_reward_weights}")
+            logging.info(f"  Strict mode: {gdpo_strict_mode} (will RAISE ERRORS if fallback occurs)")
+            
+            grpo = GDPO(
+                clip_eps=cfg.get('rl_clip_eps', 0.2),
+                entropy_coef=cfg.get('rl_entropy_coef', 0.01),
+                kl_coef=cfg.get('rl_kl_coef', 0.01),
+                max_grad_norm=cfg.get('rl_max_grad_norm', 0.5),
+                normalize_advantages=cfg.get('rl_normalize_advantages', True),
+                num_samples_per_image=num_samples_per_image,
+                use_value_function=use_value_function,
+                value_coef=cfg.get('rl_value_coef', 0.5),
+                reward_weights=gdpo_reward_weights,
+                strict_mode=gdpo_strict_mode,
+            )
+        else:
+            # GRPO or PPO mode
+            GRPO_class = GRPO_V2 if GRPO_V2 is not None else GRPO
+            logging.info(f"Using {GRPO_class.__name__} for RL training")
+            
+            grpo = GRPO_class(
+                clip_eps=cfg.get('rl_clip_eps', 0.2),
+                entropy_coef=cfg.get('rl_entropy_coef', 0.01),
+                kl_coef=cfg.get('rl_kl_coef', 0.01),
+                max_grad_norm=cfg.get('rl_max_grad_norm', 0.5),
+                normalize_advantages=cfg.get('rl_normalize_advantages', True),
+                num_samples_per_image=num_samples_per_image,
+                use_value_function=use_value_function,
+                value_coef=cfg.get('rl_value_coef', 0.5),
+            )
         
         reward_computer = build_rl_reward_computer(cfg)
+
+        # GDPO verification: ensure reward_computer can provide separate reward components
+        if rl_mode == 'gdpo':
+            if not hasattr(reward_computer, 'compute_reward_components'):
+                raise AttributeError(
+                    "[GDPO ERROR] reward_computer does not have 'compute_reward_components' method!\n"
+                    "GDPO requires separate reward signals for decoupled normalization.\n"
+                    "Make sure RLRewardComputer has compute_reward_components() method."
+                )
+            logging.info("[GDPO] ✓ Verified: reward_computer has compute_reward_components method")
+            logging.info("=" * 60)
         
         if use_value_function:
             logging.info(f"RL mode: PPO with value function (value_coef={cfg.get('rl_value_coef', 0.5)})")
+        elif rl_mode == 'gdpo':
+            logging.info(f"RL mode: GDPO with decoupled reward normalization")
         else:
             logging.info(f"RL mode: Pure GRPO (no value function)")
     else:
@@ -217,8 +273,30 @@ def main(cfg):
 
     epoch = 0 if state is None else state["epoch"]
     logging.info(f"Starting at epoch {epoch}")
-    best_score = 0 if state is None else state["best_score"]
-    logging.info(f"Best score so far: {best_score}")
+    
+    # Initialize best_score based on metric mode (max vs min)
+    # For min mode (error metrics), initialize to infinity so any score beats it
+    # For max mode, initialize to negative infinity so any score beats it
+    metric_mode = cfg.get('tracked_metric_mode', 'max')
+    
+    if state is None:
+        if metric_mode == 'min':
+            best_score = float('inf')
+        else:
+            best_score = float('-inf')
+    else:
+        loaded_best_score = state["best_score"]
+        # Validate loaded best_score is compatible with current mode
+        # If mode changed, reset to proper initial value
+        if metric_mode == 'max' and loaded_best_score == float('inf'):
+            logging.warning(f"Detected mode change: loaded best_score={loaded_best_score} but mode={metric_mode}. Resetting to -inf.")
+            best_score = float('-inf')
+        elif metric_mode == 'min' and (loaded_best_score == float('-inf') or loaded_best_score == 0):
+            logging.warning(f"Detected mode change: loaded best_score={loaded_best_score} but mode={metric_mode}. Resetting to inf.")
+            best_score = float('inf')
+        else:
+            best_score = loaded_best_score
+    logging.info(f"Best score so far: {best_score} (mode: {metric_mode})")
     if state is not None:
         rng_state = state["rng"]
         set_all_rng_states(rng_state)
@@ -308,13 +386,20 @@ def main(cfg):
 
             if val_metrics is not None:
                 tracked_metric = val_metrics[cfg.tracked_metric]
-                new_record = tracked_metric > best_score
+                
+                # Support for minimizing error metrics (default: maximize)
+                # tracked_metric_mode: "max" (default) or "min"
+                metric_mode = cfg.get('tracked_metric_mode', 'max')
+                if metric_mode == 'min':
+                    new_record = tracked_metric < best_score  # Lower is better
+                else:
+                    new_record = tracked_metric > best_score  # Higher is better
             else:
                 new_record = None
 
             if new_record:
                 best_score = tracked_metric
-                logging.info(f"New best score: {best_score}")
+                logging.info(f"New best score: {best_score} (mode: {metric_mode})")
 
             if cfg.run_test and new_record or cfg.get('test_every_epoch', False):
                 logging.info("Running test set")
@@ -474,12 +559,19 @@ def run_rl_train_epoch_batched(
     we replicate the batch and run ONE batched forward pass.
     
     This is much faster on large GPUs.
+    
+    Supports three RL modes:
+    - PPO: Uses value function baseline
+    - GRPO: Group-relative advantage without value function
+    - GDPO: Decoupled reward normalization for multi-reward training
     """
     model.train()
     evaluator = Evaluator(**args.evaluator)
     
     num_samples_per_image = args.get('rl_num_samples_per_image', 4)
     num_rl_updates = args.get('rl_num_update_epochs', 4)
+    rl_mode = args.get('rl_mode', 'grpo').lower()
+    use_gdpo = rl_mode == 'gdpo'
 
     for train_iter, data in enumerate(tqdm(loader, desc=desc)):
 
@@ -506,8 +598,34 @@ def run_rl_train_epoch_batched(
             # update epochs reuse the SAME actions (on-policy within the batch).
             rollout_action_indices = batched_outputs.get('rl_action_indices')
             
-            # Compute rewards for all samples in one go (pass num_samples for diversity reward)
-            all_rewards = reward_computer(batched_outputs, batched_data, num_samples_per_image=num_samples_per_image)  # (B * num_samples,)
+            # Compute rewards for all samples in one go
+            if use_gdpo:
+                # GDPO mode: get separate reward components for decoupled normalization
+                all_rewards, reward_components = reward_computer.compute_reward_components(
+                    batched_outputs, batched_data, num_samples_per_image=num_samples_per_image
+                )
+                
+                # Validate GDPO is working correctly
+                if reward_components is None or len(reward_components) == 0:
+                    raise ValueError(
+                        "[GDPO ERROR] compute_reward_components returned empty reward_components!\n"
+                        f"  reward_components: {reward_components}\n"
+                        "  GDPO requires at least 2 reward components. Check RLRewardComputer implementation."
+                    )
+                
+                # Log first iteration to verify GDPO is working
+                if train_iter == 0:
+                    logging.info(
+                        f"[GDPO] First batch - Verified reward components:\n"
+                        f"  Number of components: {len(reward_components)}\n"
+                        f"  Component 0 (classification): mean={reward_components[0].mean().item():.4f}, std={reward_components[0].std().item():.4f}\n"
+                        f"  Component 1 (attention/ROI): mean={reward_components[1].mean().item():.4f}, std={reward_components[1].std().item():.4f}\n"
+                        f"  Total reward: mean={all_rewards.mean().item():.4f}, std={all_rewards.std().item():.4f}"
+                    )
+            else:
+                # GRPO/PPO mode: just get the summed reward
+                all_rewards = reward_computer(batched_outputs, batched_data, num_samples_per_image=num_samples_per_image)
+                reward_components = None
         
         # Compute prostate boundary statistics for logging (use first sample per image)
         if args.get('rl_prostate_boundary_penalty_weight', 0) > 0:
@@ -521,7 +639,7 @@ def run_rl_train_epoch_batched(
             coords_stats = {}
         
         # ============================================
-        # Step 2: GRPO updates with batched forward
+        # Step 2: GRPO/GDPO updates with batched forward
         # ============================================
         rl_metrics_list = []
         supervised_loss_avg = 0.0
@@ -547,14 +665,26 @@ def run_rl_train_epoch_batched(
                 # Supervised loss (use mean over samples for stable training)
                 supervised_loss = criterion(current_outputs)
                 
-                # RL loss (GRPO or PPO depending on whether value function is used)
-                rl_loss, rl_info = grpo.compute_loss(
-                    current_log_probs,
-                    old_log_probs,
-                    all_rewards.detach(),
-                    num_samples_per_image=num_samples_per_image,
-                    values=current_values,  # Pass values for PPO mode (None for GRPO)
-                )
+                # RL loss (GRPO, GDPO, or PPO depending on mode and value function)
+                if use_gdpo:
+                    # GDPO: pass reward components for decoupled normalization
+                    rl_loss, rl_info = grpo.compute_loss(
+                        current_log_probs,
+                        old_log_probs,
+                        all_rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
+                        values=current_values,
+                        reward_components=[rc.detach() for rc in reward_components],  # GDPO uses separate components
+                    )
+                else:
+                    # GRPO/PPO: use standard summed reward
+                    rl_loss, rl_info = grpo.compute_loss(
+                        current_log_probs,
+                        old_log_probs,
+                        all_rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
+                        values=current_values,  # Pass values for PPO mode (None for GRPO)
+                    )
                 
                 # Combined loss
                 rl_weight = args.get('rl_loss_weight', 1.0)

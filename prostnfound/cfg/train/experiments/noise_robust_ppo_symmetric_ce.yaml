@@ -1,0 +1,188 @@
+# =============================================================================
+# ProstNFound-RL V3 - PPO with Noise-Robust Loss Functions
+# =============================================================================
+# 
+# This config combines:
+# 1. RL (PPO) for learning attention patterns
+# 2. Noise-robust loss functions for handling noisy labels
+#
+# The attention module learns WHERE to look via RL rewards,
+# while the decoder is supervised with noise-robust losses.
+#
+# NOISE-ROBUST LOSS OPTIONS (switch between these by uncommenting):
+# - mil_prop_bce_entropy_reg: Standard (baseline)
+# - topk_mil: Top-K MIL - only supervise top k% pixels as cancer
+# - topk_mil_soft: Differentiable Top-K with softmax weighting
+# - thresholded_involvement: Compare fraction > 0.5 to involvement
+# - thresholded_involvement_entropy_reg: Thresholded with entropy reg
+# - symmetric_ce: Symmetric Cross Entropy (noise-robust from DivideMix)
+# - symmetric_ce_entropy_reg: SCE with entropy regularization
+#
+# =============================================================================
+
+name: "V3-PPO-symmetric_ce"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 8
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# Model configuration - V2 with continuous attention (same as your PPO config)
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ discrete_attention: false  # Continuous attention
+ use_value_function: true   # PPO requires value function
+ upsample: false
+ boundary_tolerance_patches: 2
+ detach_attention_for_decoder: false
+
+# =============================================================================
+# LOSS CONFIGURATION - Switch between noise-robust options
+# =============================================================================
+# 
+# OPTION 1: Standard (baseline) - uniform uncertainty problem
+# loss: mil_prop_bce_entropy_reg
+#
+# OPTION 2: Top-K MIL (RECOMMENDED) - only supervise top k% as cancer
+# loss: topk_mil
+# loss_kw:
+#   min_top_k_fraction: 0.05  # Minimum fraction to supervise
+#   use_soft_topk: false       # Hard selection (more interpretable)
+#   temperature: 0.1           # For soft top-k
+#
+# OPTION 3: Soft Top-K MIL - differentiable version
+# loss: topk_mil_soft
+# loss_kw:
+#   min_top_k_fraction: 0.05
+#   temperature: 0.1
+#
+# OPTION 4: Thresholded Involvement - compare fraction > 0.5 to involvement
+# loss: thresholded_involvement_entropy_reg
+# loss_kw:
+#   threshold: 0.5
+#   soft_temperature: 0.1
+#
+# OPTION 5: Symmetric Cross Entropy - noise-robust from DivideMix paper
+loss: symmetric_ce_entropy_reg
+loss_kw:
+  alpha: 1.0    # Standard CE weight
+  beta: 1.0     # Reverse CE weight (higher = more noise-robust)
+  epsilon: 1e-4
+#
+# OPTION 6: Strong Symmetric CE (more aggressive noise robustness)
+# loss: symmetric_ce_entropy_reg
+# loss_kw:
+#   alpha: 0.5
+#   beta: 2.0     # Higher beta for more noise robustness
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# =============================================================================
+# RL CONFIGURATION (PPO)
+# =============================================================================
+use_rl: true
+rl_mode: ppo
+
+# Use HARD mask constraint for decoder (matches RL attention constraint)
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+# Reward configuration - what the RL agent optimizes
+rl_reward_mode: classification_only
+# Options:
+# - 'classification_only': Only classification head performance
+# - 'combined_v2': Classification + ROI involvement (try with noise-robust loss)
+# - 'roi_only': Only ROI/heatmap involvement accuracy
+# - 'confidence_based': Reward high confidence on correct predictions
+rl_cspca_bonus: 2
+
+# PPO hyperparameters
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.01
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+rl_value_coef: 0.5
+
+# Benign Sparsity Penalty (encourages low attention for benign cases)
+rl_benign_sparsity_penalty_weight: 0.0  # Try 0.3-1.0 to enable
+
+# =============================================================================
+# OPTIMIZER CONFIGURATION
+# =============================================================================
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 1.0e-05
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.001
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+# scheduler: cosine
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+
+# =============================================================================
+# TRACKED METRIC - Choose based on experiment goal
+# =============================================================================
+# For CLASSIFICATION experiments (AUROC, higher is better):
+tracked_metric: val/core_auc_high_involvement
+# tracked_metric_mode: max  # Default
+
+# For CALIBRATION experiments (error metrics, lower is better):
+# tracked_metric: val/bal_prop_pred_err
+# tracked_metric_mode: min
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

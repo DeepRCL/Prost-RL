@@ -11,7 +11,7 @@ Key Features (v2):
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 from medAI.layers.masked_prediction_module import MaskedPredictionModule
 
 
@@ -1169,6 +1169,140 @@ class RLRewardComputer:
             rewards = torch.where(cspca_mask, rewards * self.cspca_bonus, rewards)
         
         return rewards
+    
+    def compute_reward_components(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+        num_samples_per_image: int = 1,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """
+        Compute both total rewards and separate reward components for GDPO.
+        
+        GDPO (Group reward-Decoupled Normalization Policy Optimization) requires
+        separate reward signals to be normalized independently before combining.
+        This method returns:
+        1. The total (summed) reward for backward compatibility
+        2. A list of separate reward components for GDPO's decoupled normalization
+        
+        For ProstNFound-RL, the two main reward components are:
+        - Classification reward: Based on classification head performance
+        - Attention/sparsity reward: Based on attention-involvement correspondence
+        
+        Args:
+            outputs: Model outputs (data dict with 'cancer_logits' added)
+            data: Original batch data
+            num_samples_per_image: Number of RL samples per image
+            
+        Returns:
+            total_reward: Summed rewards (B,) - for backward compatibility
+            reward_components: List of separate reward tensors for GDPO
+        """
+        cancer_logits = outputs.get('cancer_logits', outputs.get('mask_logits'))
+        if cancer_logits is None:
+            raise KeyError("Could not find 'cancer_logits' or 'mask_logits' in outputs")
+        
+        device = cancer_logits.device
+        
+        # Component 1: Classification reward (always computed)
+        cls_reward = self.compute_classification_reward(outputs, data)
+        
+        # Component 2: Attention/sparsity reward (mode-dependent)
+        if self.reward_mode == 'attention_proportional':
+            attn_reward = self.compute_attention_proportional_reward(outputs, data)
+        elif self.reward_mode == 'classification_gated_needle':
+            attn_reward = self.compute_classification_gated_needle_reward(outputs, data)
+            # For gated reward, cls component is embedded, so subtract it
+            attn_reward = attn_reward - cls_reward * (attn_reward != 0).float()
+        elif self.reward_mode == 'sparse_attention':
+            attn_reward = self.compute_sparse_attention_reward(outputs, data)
+            # Sparse attention already includes cls for cancer, extract attention component
+            attn_reward = attn_reward - cls_reward
+        elif self.reward_mode == 'attention_contrast':
+            attn_reward = self.compute_attention_contrast_reward(outputs, data)
+            # Contrast already includes cls, extract attention component
+            attn_reward = attn_reward - cls_reward
+        elif self.reward_mode == 'roi_only':
+            attn_reward = self.compute_roi_involvement_reward(cancer_logits, data)
+            # ROI-only mode: no classification component
+            cls_reward = torch.zeros_like(attn_reward)
+        elif self.reward_mode == 'combined_v2':
+            # Combined mode: Return UNWEIGHTED components for GDPO!
+            # 
+            # CRITICAL FIX: For GDPO to work correctly, reward components must be 
+            # returned UNWEIGHTED. Here's why:
+            #
+            # Normalization removes constant scaling:
+            #   normalize(w * X) = normalize(X) for any constant w
+            #
+            # So if we apply rl_classification_reward_weight and rl_heatmap_reward_weight here:
+            #   - GRPO (uses __call__) sees: normalize(w1*r1 + w2*r2) ✓ weights matter
+            #   - GDPO (uses this method) sees: [normalize(w1*r1), normalize(w2*r2)]
+            #                                  = [normalize(r1), normalize(r2)] ✗ weights ignored!
+            #
+            # The rl_*_reward_weight config parameters get REMOVED by normalization in GDPO!
+            # Instead, weighting in GDPO should be controlled via gdpo_reward_weights config.
+            #
+            # Solution: Return UNWEIGHTED components. Use gdpo_reward_weights to control
+            # the relative importance of each reward signal in GDPO.
+            roi_reward = self.compute_roi_involvement_reward(cancer_logits, data)
+            # Keep cls_reward and attn_reward UNWEIGHTED for GDPO
+            cls_reward = cls_reward  # No weighting!
+            attn_reward = roi_reward  # No weighting!
+        elif self.reward_mode == 'classification_only':
+            # Classification only: no attention component
+            attn_reward = torch.zeros_like(cls_reward)
+        elif self.reward_mode == 'hierarchical_gated':
+            attn_reward = self.compute_hierarchical_gated_reward(outputs, data)
+            # Gated reward combines both, approximate separation
+            attn_reward = attn_reward - cls_reward * (attn_reward > 0).float()
+        else:
+            # Default: compute as in __call__ but extract components
+            total = self(outputs, data, num_samples_per_image)
+            attn_reward = total - cls_reward
+        
+        # Apply csPCa bonus to classification reward (not attention)
+        if self.cspca_bonus != 1.0 and 'grade_group' in data:
+            cspca_mask = data['grade_group'].to(device) > 2
+            if cspca_mask.ndim > 1:
+                cspca_mask = cspca_mask.squeeze(-1)
+            cls_reward = torch.where(cspca_mask, cls_reward * self.cspca_bonus, cls_reward)
+        
+        # Apply diversity reward to attention component if enabled
+        if self.diversity_reward_weight > 0 and 'rl_attention_coords' in outputs:
+            rl_coords = outputs['rl_attention_coords']
+            diversity_bonus = self.compute_diversity_reward(rl_coords, num_samples_per_image)
+            attn_reward = attn_reward + self.diversity_reward_weight * diversity_bonus
+        
+        # Apply benign sparsity penalty to attention component
+        if self.benign_sparsity_penalty_weight > 0 and 'rl_attention_map' in outputs:
+            rl_attention_map = outputs['rl_attention_map']
+            sparsity_penalty = self.compute_benign_sparsity_penalty(rl_attention_map, data)
+            attn_reward = attn_reward - self.benign_sparsity_penalty_weight * sparsity_penalty
+        
+        # Apply prostate boundary penalty to attention component
+        if self.prostate_boundary_penalty_weight > 0 and 'rl_attention_coords' in outputs:
+            rl_coords = outputs['rl_attention_coords']
+            prostate_mask = data['prostate_mask'].to(device)
+            boundary_penalty = self.compute_prostate_boundary_penalty(rl_coords, prostate_mask)
+            attn_reward = attn_reward - boundary_penalty
+        
+        # Total reward (for logging and GRPO compatibility)
+        # For combined_v2, apply weights to total while keeping components unweighted
+        if self.reward_mode == 'combined_v2':
+            # Components are unweighted for GDPO's decoupled normalization
+            reward_components = [cls_reward, attn_reward]
+            # But total reward matches GRPO's expectation (weighted sum)
+            total_reward = (
+                self.classification_reward_weight * cls_reward + 
+                self.heatmap_reward_weight * attn_reward
+            )
+        else:
+            # For other modes, components and total are the same
+            total_reward = cls_reward + attn_reward
+            reward_components = [cls_reward, attn_reward]
+        
+        return total_reward, reward_components
 
 
 def build_rl_reward_computer(args) -> RLRewardComputer:

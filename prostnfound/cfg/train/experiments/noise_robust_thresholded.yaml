@@ -1,0 +1,110 @@
+# ProstNFound-RL V2 - NOISE-ROBUST EXPERIMENT: Thresholded Involvement Loss
+# 
+# Thresholded Involvement Loss
+# Instead of comparing mean probability to involvement, we threshold the 
+# predictions at 0.5 and compare the fraction of "on" pixels to involvement.
+# 
+# WHY: This makes the loss directly optimize for the calibration metric:
+# - If involvement = 50%, we want 50% of pixels to have prob > 0.5
+# - Encourages sharp predictions (high or low, not middle values like 0.55)
+#
+# This loss is directly aligned with how we evaluate calibration.
+
+name: "PNF-SUPERVISED-ThresholdedInvolvement"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 16
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# Model configuration - SAME as supervised baseline
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ use_clinical_in_policy: true
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ discrete_attention: false  # Continuous attention
+ use_value_function: false  # Not needed for supervised
+ upsample: false
+ boundary_tolerance_patches: 2
+
+# NOISE-ROBUST LOSS: Thresholded Involvement with entropy regularization
+loss: thresholded_involvement_entropy_reg
+loss_kw:
+  threshold: 0.5              # Probability threshold for "on" pixel
+  soft_temperature: 0.1       # Temperature for soft thresholding (lower = sharper)
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# RL configuration - DISABLED for supervised training
+use_rl: false
+
+# Use HARD mask constraint for decoder
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+# Optimizer configuration
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 8.0e-06
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.01
+epochs: 40
+accumulate_grad_steps: 1
+cutoff_epoch: null
+scheduler: cosine
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+# Calibration-focused tracking (for heatmap calibration experiments)
+# - val/bal_prop_pred_err: Balanced MAE between heatmap avg and true involvement
+tracked_metric: val/bal_prop_pred_err
+tracked_metric_mode: min  # Use "min" for error metrics (lower is better)
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

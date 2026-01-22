@@ -1,0 +1,151 @@
+# ProstNFound-RL V2 - SUPERVISED MODE (No RL)
+# This is for comparison with RL version
+# 
+# Same architecture as RL model but trained with standard supervised loss only.
+# The attention mechanism will be trained implicitly through the decoder gradients.
+# NO SAMPLING - just standard single forward pass per batch.
+#
+# Compare this with RL models to see if RL provides any benefit.
+
+name: "PNF-RL-V3-SUPERVISED-BalancedLoss-maskdecoder"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 16
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# Model configuration - SAME as RL version
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ use_clinical_in_policy: true
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ discrete_attention: false  # Continuous attention
+ use_value_function: false  # Not needed for supervised
+ upsample: false
+ boundary_tolerance_patches: 2
+
+# Loss configuration - SAME as RL version
+# AVAILABLE NOISE-ROBUST LOSS OPTIONS:
+# --------------------------------------
+# Standard: "mil_prop_bce_entropy_reg" (current baseline)
+# 
+# Noise-Robust Options:
+#   1. "topk_mil"                      - Top-K MIL: Only supervise top k% pixels as cancer
+#   2. "topk_mil_soft"                 - Top-K MIL with differentiable soft selection
+#   3. "thresholded_involvement"       - Compare fraction of pixels > 0.5 to involvement
+#   4. "thresholded_involvement_entropy_reg" - Thresholded with entropy regularization
+#   5. "symmetric_ce"                  - Symmetric Cross Entropy for noise robustness
+#   6. "symmetric_ce_entropy_reg"      - SCE with entropy regularization
+#
+# Use loss_kw to customize loss parameters (see examples in cfg/train/experiments/)
+
+loss: mil_prop_bce_entropy_reg
+# loss: topk_mil
+# loss: thresholded_involvement_entropy_reg
+# loss: symmetric_ce_entropy_reg
+
+# Loss-specific keyword arguments (optional)
+# loss_kw:
+#   # For topk_mil / topk_mil_soft:
+#   min_top_k_fraction: 0.05  # Minimum fraction of pixels to supervise as cancer
+#   use_soft_topk: false       # Use hard top-k (set true for differentiable)
+#   temperature: 0.1           # Temperature for soft selection
+#   
+#   # For thresholded_involvement:
+#   threshold: 0.5             # Probability threshold for "on" pixel
+#   soft_temperature: 0.1      # Temperature for soft thresholding
+#   
+#   # For symmetric_ce:
+#   alpha: 1.0                 # Weight for standard cross entropy
+#   beta: 1.0                  # Weight for reverse cross entropy (higher = more noise robust)
+#   epsilon: 1e-4              # Numerical stability for RCE
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# RL configuration - DISABLED for supervised training
+use_rl: false
+
+# Use HARD mask constraint for decoder (matches RL attention constraint)
+# This sets decoder logits to -100 outside prostate (sigmoid → ~0)
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false  # Disabled - using hard constraint instead (same as PPO)
+
+# Optimizer configuration - SAME as RL version
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 8.0e-06
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.01
+epochs: 40
+accumulate_grad_steps: 1
+cutoff_epoch: null
+scheduler: cosine
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_rl_v2
+seed: 30
+
+# TRACKED METRIC OPTIONS:
+# For classification experiments (AUROC, higher is better):
+#   tracked_metric: val/core_auc_high_involvement
+#   tracked_metric_mode: max (default)
+#
+# For calibration experiments (error metrics, lower is better):
+#   tracked_metric: val/bal_prop_pred_err
+#   tracked_metric_mode: min
+#
+# Available heatmap/calibration metrics:
+#   - val/bal_prop_pred_err: Balanced MAE (heatmap avg vs involvement)
+#   - val/prop_pred_err_thresholded: MAE of thresholded (>0.5) predictions
+#   - val/thresholded_involvement_correlation_spearman: Correlation (higher is better, use mode: max)
+
+tracked_metric: val/core_auc_high_involvement
+# tracked_metric_mode: min  # Uncomment for error metrics (lower is better)
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v2/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

@@ -1,0 +1,128 @@
+# =============================================================================
+# ProstNFound-RL V3 - PPO with Clean RL/Supervised Separation
+# =============================================================================
+# 
+# This config tests whether RL helps by using CLEAN SEPARATION:
+# - Policy (attention module) trained ONLY by RL loss
+# - Decoder trained ONLY by supervised loss
+# 
+# With detach_attention_for_decoder: true, the supervised loss gradient
+# does NOT flow back to the policy. Only RL rewards train the attention.
+#
+# Compare with:
+# - Supervised-only configs (use_rl: false)
+# - PPO with detach_attention_for_decoder: false (mixed training)
+#
+# =============================================================================
+
+name: "V3-PPO-CleanRL"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 16
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# Model configuration
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ discrete_attention: false  # Continuous attention
+ use_value_function: true   # PPO requires value function
+ upsample: false
+ boundary_tolerance_patches: 2
+ #
+ # CLEAN RL SEPARATION:
+ # When True: Policy trained ONLY by RL, decoder trained ONLY by supervised
+ # When False: Both losses train both modules (original mixed behavior)
+ #
+ detach_attention_for_decoder: true
+
+# STANDARD LOSS (not noise-robust) for fair comparison
+loss: mil_prop_bce_entropy_reg
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# RL CONFIGURATION (PPO)
+use_rl: true
+rl_mode: ppo
+
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+rl_reward_mode: classification_only
+rl_cspca_bonus: 2
+
+# PPO hyperparameters
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.01
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+rl_value_coef: 0.5
+rl_benign_sparsity_penalty_weight: 0.0
+
+# Optimizer
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 8.0e-06
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.01
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+scheduler: cosine
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_rl_v3
+seed: 30
+tracked_metric: val/core_auc_high_involvement
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

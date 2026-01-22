@@ -14,7 +14,7 @@
 # - Phase 2 refines the policy for better exploration/exploitation
 # - Should exceed performance of either supervised-only or RL-from-scratch
 
-name: "PPO-PHASED-supv-rl-5"
+name: "V3-PPO-PHASED-supv-rl-5"
 
 data:
  fold: 0
@@ -106,7 +106,7 @@ rl_num_samples_per_image: 8  # Higher for better gradient estimates
 # PPO hyperparameters
 rl_num_update_epochs: 4  # PPO typically uses more update epochs than GRPO
 rl_clip_eps: 0.2  # Standard PPO clipping parameter
-rl_entropy_coef: 0.06  # Encourage exploration (slightly higher for phased training)
+rl_entropy_coef: 0.05  # Encourage exploration (slightly higher for phased training)
 rl_kl_coef: 0.0  # Not typically used in PPO (used in PPO-KL variant)
 rl_max_grad_norm: 0.6  # Gradient clipping for stability
 rl_loss_weight: 1.0  # Weight for RL loss component

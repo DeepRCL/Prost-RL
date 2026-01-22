@@ -25,6 +25,8 @@ class ProstNFoundRLV2(nn.Module):
         use_prostate_mask_constraint: Constrain to prostate (default: True)
         discrete_attention: If True, sample k patches; if False, use continuous (default: True)
         use_value_function: Use value function for PPO (default: False)
+        detach_attention_for_decoder: If True, detach attention features before decoder
+            so policy is trained ONLY by RL loss, not by supervised loss (default: False)
     """
     
     def __init__(
@@ -38,6 +40,7 @@ class ProstNFoundRLV2(nn.Module):
         discrete_attention: bool = True,
         use_value_function: bool = False,
         boundary_tolerance_patches: int = 1,  # Patches to dilate prostate mask (on 16x16 feature grid)
+        detach_attention_for_decoder: bool = False,  # If True, policy trained ONLY by RL
     ):
         super().__init__()
         
@@ -49,6 +52,7 @@ class ProstNFoundRLV2(nn.Module):
         self.discrete_attention = discrete_attention
         self.use_value_function = use_value_function
         self.boundary_tolerance_patches = boundary_tolerance_patches
+        self.detach_attention_for_decoder = detach_attention_for_decoder
         
         if freeze_prostnfound:
             logging.info("Freezing ProstNFound weights")
@@ -209,15 +213,23 @@ class ProstNFoundRLV2(nn.Module):
         sparse_embedding = sparse_embedding.repeat_interleave(len(image), 0)
         
         # Step 6: CRITICAL - Add attention conditioning to embeddings
+        # If detach_attention_for_decoder is True, we detach attention_features
+        # so the policy is trained ONLY by RL loss, not by supervised decoder loss.
+        # This ensures clean separation: RL trains attention, supervised trains decoder.
+        if self.detach_attention_for_decoder:
+            attention_features_for_decoder = attention_features.detach()
+        else:
+            attention_features_for_decoder = attention_features
+        
         if self.discrete_attention:
             # Discrete: Add selected patch features as sparse embeddings
             # attention_features: (B, k, C)
-            patch_embeddings = self.attention_projection(attention_features)  # B x k x 256
+            patch_embeddings = self.attention_projection(attention_features_for_decoder)  # B x k x 256
             sparse_embedding = torch.cat([sparse_embedding, patch_embeddings], dim=1)
         else:
             # Continuous: Modulate dense embeddings with attention
             # attention_features: (B, C, H, W)
-            attention_modulation = self.attention_modulation(attention_features)  # B x 256 x H x W
+            attention_modulation = self.attention_modulation(attention_features_for_decoder)  # B x 256 x H x W
             dense_embedding = dense_embedding + attention_modulation
         
         # Step 7: Add clinical prompts
@@ -390,6 +402,7 @@ def prostnfound_rl_v2_adapter_medsam(
     discrete_attention: bool = True,
     use_value_function: bool = False,
     boundary_tolerance_patches: int = 1,
+    detach_attention_for_decoder: bool = False,
     prostnfound_kw: dict = {},
     **kwargs,
 ):
@@ -436,6 +449,7 @@ def prostnfound_rl_v2_adapter_medsam(
         discrete_attention=discrete_attention,
         use_value_function=use_value_function,
         boundary_tolerance_patches=boundary_tolerance_patches,
+        detach_attention_for_decoder=detach_attention_for_decoder,
     )
     
     return model
@@ -455,6 +469,7 @@ def prostnfound_rl_v2_adapter_medsam_legacy(
     use_class_decoder: bool = True,
     use_value_function: bool = False,
     boundary_tolerance_patches: int = 1,
+    detach_attention_for_decoder: bool = False,
     **kwargs,
 ):
     """
@@ -477,6 +492,7 @@ def prostnfound_rl_v2_adapter_medsam_legacy(
         discrete_attention=discrete_attention,
         use_value_function=use_value_function,
         boundary_tolerance_patches=boundary_tolerance_patches,
+        detach_attention_for_decoder=detach_attention_for_decoder,
         prostnfound_kw={'use_class_decoder': use_class_decoder},
         **kwargs,
     )

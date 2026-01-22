@@ -1,0 +1,142 @@
+# =============================================================================
+# ProstNFound-RL Comparison - GRPO 
+# =============================================================================
+# 
+# GRPO (Group Relative Policy Optimization) without value function.
+# This is similar to the approach in DeepSeek-R1 and Seg-R1 papers.
+#
+# Key differences from PPO:
+# - No value function (simpler, fewer hyperparameters)
+# - Group-based advantage normalization within each image
+# - Single reward signal normalized within group
+#
+# Key differences from GDPO:
+# - Sums rewards first, THEN normalizes (can cause advantages collapse)
+# - Does not preserve relative differences between reward signals
+#
+# =============================================================================
+
+name: "V4-GRPO-combined_v2-comparison-symmetric_ce"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 8
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# Model configuration
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ discrete_attention: false  # Continuous attention
+ use_value_function: false  # GRPO does NOT use value function
+ upsample: false
+ boundary_tolerance_patches: 2
+ detach_attention_for_decoder: true
+
+# =============================================================================
+# LOSS CONFIGURATION
+# =============================================================================
+# Using symmetric CE as the noise-robust loss (best from your results)
+loss: symmetric_ce_entropy_reg
+loss_kw:
+  alpha: 1.0    # Standard CE weight
+  beta: 1.0     # Reverse CE weight
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# =============================================================================
+# RL CONFIGURATION - GRPO MODE
+# =============================================================================
+use_rl: true
+rl_mode: grpo  # Group Relative Policy Optimization (no value function)
+
+# Use HARD mask constraint for decoder
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+# Reward configuration - combined for both classification and attention
+# GRPO will sum these rewards first, then normalize
+rl_reward_mode: combined_v2
+rl_heatmap_reward_weight: 0.5
+rl_classification_reward_weight: 0.5
+rl_cspca_bonus: 2
+
+# GRPO hyperparameters (no value function, so no value_coef)
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.01
+rl_kl_coef: 0.01  # GRPO typically uses KL penalty
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+
+# Benign Sparsity Penalty (disabled for fair comparison)
+rl_benign_sparsity_penalty_weight: 0.0
+
+# =============================================================================
+# OPTIMIZER CONFIGURATION
+# =============================================================================
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 1.0e-05
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.0001
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_rl_comparison
+seed: 30
+
+# Track high involvement performance (relevant for csPCa detection)
+tracked_metric: val/core_auc_high_involvement
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v4/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100
