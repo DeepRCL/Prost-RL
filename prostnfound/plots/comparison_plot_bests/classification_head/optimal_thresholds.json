@@ -1,0 +1,26 @@
+{
+  "Supervised": {
+    "threshold_balanced_accuracy": 0.33,
+    "max_balanced_accuracy": 0.7388972751463062,
+    "threshold_f1": 0.51,
+    "max_f1": 0.49528301886792453
+  },
+  "PPO": {
+    "threshold_balanced_accuracy": 0.3,
+    "max_balanced_accuracy": 0.679774160354308,
+    "threshold_f1": 0.37,
+    "max_f1": 0.38461538461538464
+  },
+  "roi": {
+    "threshold_balanced_accuracy": 0.31,
+    "max_balanced_accuracy": 0.6727410369040657,
+    "threshold_f1": 0.39,
+    "max_f1": 0.37735849056603776
+  },
+  "GRPO": {
+    "threshold_balanced_accuracy": 0.34,
+    "max_balanced_accuracy": 0.7272947746816623,
+    "threshold_f1": 0.43,
+    "max_f1": 0.4951923076923077
+  }
+}

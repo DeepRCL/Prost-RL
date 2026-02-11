@@ -6,14 +6,12 @@
 # With GDPO for multi-reward decoupled normalization
 #
 # Key fixes:
-# 1. REMOVED detach_attention_for_decoder (was breaking gradient flow!) 
-# 2. Using classification_only reward mode (simpler, more stable)
 # 3. Matched hyperparameters to working config
 # 4. Added scheduler: cosine
 #
 # =============================================================================
 
-name: "V4-GDPO-combined_v2-symmetric_ce"
+name: "V4-GDPO-combined_v2-normalmilloss-6roll"
 
 data:
  fold: 0
@@ -58,6 +56,7 @@ model_kw:
 
 # Loss configuration - same as working config
 loss: mil_prop_bce_entropy_reg
+
 decoder_prostate_mask_constraint: true
 outside_prostate_penalty: false
 add_image_clf: true
@@ -81,7 +80,7 @@ rl_cspca_bonus: 2
 gdpo_reward_weights: [0.5, 1.0]
 
 # Hyperparameters - MATCHED to working config
-rl_num_samples_per_image: 4
+rl_num_samples_per_image: 6
 rl_num_update_epochs: 2        # Was 4, working uses 2
 rl_clip_eps: 0.1               # Was 0.2, working uses 0.1
 rl_entropy_coef: 0.005         # Was 0.01, working uses 0.005

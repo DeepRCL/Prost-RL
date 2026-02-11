@@ -1,0 +1,82 @@
+{
+  "Supervised": {
+    "threshold_balanced_accuracy": 0.33,
+    "max_balanced_accuracy": 0.7388972751463062,
+    "threshold_f1": 0.51,
+    "max_f1": 0.49528301886792453,
+    "threshold_sensitivity": 0.15000000000000002,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.54,
+    "max_specificity": 0.9020122484689413
+  },
+  "PPO-old": {
+    "threshold_balanced_accuracy": 0.37,
+    "max_balanced_accuracy": 0.7305563488501761,
+    "threshold_f1": 0.48000000000000004,
+    "max_f1": 0.48444444444444446,
+    "threshold_sensitivity": 0.08,
+    "max_sensitivity": 0.9222797927461139,
+    "threshold_specificity": 0.5700000000000001,
+    "max_specificity": 0.9046369203849519
+  },
+  "V4-GDPO-combined_v2-thresholded_involvement_entropy_reg\n": {
+    "threshold_balanced_accuracy": 0.32,
+    "max_balanced_accuracy": 0.7349602672722905,
+    "threshold_f1": 0.47000000000000003,
+    "max_f1": 0.48232848232848236,
+    "threshold_sensitivity": 0.13,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.56,
+    "max_specificity": 0.9011373578302713
+  },
+  "V4-GDPO-combined_v2-normalmilloss-6roll": {
+    "threshold_balanced_accuracy": 0.5,
+    "max_balanced_accuracy": 0.7267893326805652,
+    "threshold_f1": 0.65,
+    "max_f1": 0.47368421052631576,
+    "threshold_sensitivity": 0.18000000000000002,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.64,
+    "max_specificity": 0.9037620297462817
+  },
+  "V3-PPO-thresholded involvement entropy reg_detached": {
+    "threshold_balanced_accuracy": 0.09999999999999999,
+    "max_balanced_accuracy": 0.726041369181184,
+    "threshold_f1": 0.25,
+    "max_f1": 0.45,
+    "threshold_sensitivity": 0.04,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.26,
+    "max_specificity": 0.9020122484689413
+  },
+  "V3-PPO-thresholded involvement entropy reg": {
+    "threshold_balanced_accuracy": 0.08,
+    "max_balanced_accuracy": 0.7277911504585243,
+    "threshold_f1": 0.13,
+    "max_f1": 0.4572564612326044,
+    "threshold_sensitivity": 0.03,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.22,
+    "max_specificity": 0.9011373578302713
+  },
+  "ProstNFound+": {
+    "threshold_balanced_accuracy": 0.09,
+    "max_balanced_accuracy": 0.659864731934415,
+    "threshold_f1": 0.11,
+    "max_f1": 0.3847980997624703,
+    "threshold_sensitivity": 0.05,
+    "max_sensitivity": 0.9378238341968912,
+    "threshold_specificity": 0.12,
+    "max_specificity": 0.9142607174103237
+  },
+  "ProstNFound+v2": {
+    "threshold_balanced_accuracy": 0.16,
+    "max_balanced_accuracy": 0.7138608969215636,
+    "threshold_f1": 0.22,
+    "max_f1": 0.44145873320537427,
+    "threshold_sensitivity": 0.08,
+    "max_sensitivity": 0.917098445595855,
+    "threshold_specificity": 0.33,
+    "max_specificity": 0.9090113735783028
+  }
+}

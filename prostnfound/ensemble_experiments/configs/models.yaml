@@ -1,0 +1,45 @@
+# Model Ensemble Configuration
+# Defines all models available for ensembling
+
+models:
+  v3_ppo_symmetric:
+    name: "V3-PPO-symmetric_ce"
+    checkpoint: "checkpoints_rl_v3/V3-PPO-symmetric_ce/best_rl.pth"
+    type: "ppo"
+    description: "PPO with symmetric cross-entropy loss"
+    
+  v3_ppo_thresholded:
+    name: "V3-PPO-thresholded_involvement_entropy_reg"  
+    checkpoint: "checkpoints_rl_v3/V3-PPO-thresholded_involvement_entropy_reg/best_rl.pth"
+    type: "ppo"
+    description: "PPO with thresholded involvement and entropy regularization"
+    
+  v4_gdpo_normalmil:
+    name: "V4-GDPO-combined_v2-normalmilloss"
+    checkpoint: "checkpoints_rl_v4/V4-GDPO-combined_v2-normalmilloss-6roll/best_rl.pth"
+    type: "gdpo"
+    description: "GDPO with normal MIL loss"
+    
+  v4_gdpo_thresholded:
+    name: "V4-GDPO-combined_v2-thresholded_involvement_entropy_reg"
+    checkpoint: "checkpoints_rl_v4/V4-GDPO-combined_v2-thresholded_involvement_entropy_reg/best_rl.pth"
+    type: "gdpo"
+    description: "GDPO with thresholded involvement"
+    
+  supervised:
+    name: "PNF-RL-V3-SUPERVISED-BalancedLoss-maskdecoder"
+    checkpoint: "checkpoints_rl_v2/PNF-RL-V3-SUPERVISED-BalancedLoss-maskdecoder/best_rl.pth"
+    type: "supervised"
+    description: "Supervised baseline with balanced loss and mask decoder"
+
+# Default ensemble uses all 5 models
+default_ensemble:
+  - v3_ppo_symmetric
+  - v3_ppo_thresholded
+  - v4_gdpo_normalmil
+  - v4_gdpo_thresholded
+  - supervised
+
+# Data configuration - reuse existing data config
+data:
+  base_config: "cfg/data/nct.yaml"

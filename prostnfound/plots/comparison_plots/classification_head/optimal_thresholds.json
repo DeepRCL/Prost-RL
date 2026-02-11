@@ -1,0 +1,42 @@
+{
+  "PPO-old": {
+    "threshold_balanced_accuracy": 0.3,
+    "max_balanced_accuracy": 0.679774160354308,
+    "threshold_f1": 0.37,
+    "max_f1": 0.38461538461538464,
+    "threshold_sensitivity": 0.17,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.55,
+    "max_specificity": 0.9028871391076115
+  },
+  "masked": {
+    "threshold_balanced_accuracy": 0.24000000000000002,
+    "max_balanced_accuracy": 0.6881490849913191,
+    "threshold_f1": 0.34,
+    "max_f1": 0.3895253682487725,
+    "threshold_sensitivity": 0.14,
+    "max_sensitivity": 0.9119170984455959,
+    "threshold_specificity": 0.5,
+    "max_specificity": 0.9037620297462817
+  },
+  "roi_reward": {
+    "threshold_balanced_accuracy": 0.31,
+    "max_balanced_accuracy": 0.6727410369040657,
+    "threshold_f1": 0.39,
+    "max_f1": 0.37735849056603776,
+    "threshold_sensitivity": 0.18000000000000002,
+    "max_sensitivity": 0.9067357512953368,
+    "threshold_specificity": 0.55,
+    "max_specificity": 0.9046369203849519
+  },
+  "ProstNFound+": {
+    "threshold_balanced_accuracy": 0.09,
+    "max_balanced_accuracy": 0.659864731934415,
+    "threshold_f1": 0.11,
+    "max_f1": 0.3847980997624703,
+    "threshold_sensitivity": 0.05,
+    "max_sensitivity": 0.9378238341968912,
+    "threshold_specificity": 0.12,
+    "max_specificity": 0.9142607174103237
+  }
+}

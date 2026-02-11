@@ -174,7 +174,7 @@ class CancerLogitsHeatmapsEvaluator:
             tracked_data[key] = data[key]
         tracked_data.update(bag_level_info)
 
-        if data.get("image_level_classification_outputs"):
+        if "image_level_classification_outputs" in data and data["image_level_classification_outputs"] is not None:
             tracked_data["image_level_cancer_logits"] = (
                 data["image_level_classification_outputs"][0]
                 .detach()

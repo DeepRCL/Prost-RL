@@ -51,6 +51,11 @@ try:
     from medAI.modeling.gdpo import GDPO
 except ImportError:
     GDPO = None
+# Import DRPO for domain-robust policy optimization with hierarchical scaling
+try:
+    from medAI.modeling.drpo import DRPO
+except ImportError:
+    DRPO = None
 from medAI.modeling.setr import SETR
 from torch.nn import functional as F
 from tqdm import tqdm
@@ -84,6 +89,7 @@ def main(cfg):
     # setup
     if cfg.checkpoint_dir is not None:
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+        OmegaConf.save(cfg, os.path.join(cfg.checkpoint_dir, "config.yaml"), resolve=True)
         log_file_path = os.path.join(cfg.checkpoint_dir, "log.txt")
     else:
         log_file_path = None
@@ -189,11 +195,47 @@ def main(cfg):
         # Check if using PPO mode (with value function)
         use_value_function = cfg.model_kw.get('use_value_function', False)
         
-        # Determine RL mode: ppo, grpo, or gdpo
+        # Determine RL mode: ppo, grpo, gdpo, or drpo
         rl_mode = cfg.get('rl_mode', 'grpo').lower()
         logging.info(f"RL mode: {rl_mode.upper()}")
         
-        if rl_mode == 'gdpo':
+        if rl_mode == 'drpo':
+            # DRPO: Domain-Robust Policy Optimization (GDPO + hierarchical scaling)
+            if DRPO is None:
+                raise ImportError("DRPO not available. Please check medAI.modeling.drpo import.")
+            
+            logging.info("=" * 60)
+            logging.info("DRPO MODE ENABLED - Hierarchical Advantage Scaling")
+            logging.info("=" * 60)
+            logging.info("DRPO = GDPO + domain clustering + temperature scaling")
+            logging.info("This balances learning across rare/hard samples (e.g., cancer cases)")
+            
+            # DRPO-specific hyperparameters
+            drpo_reward_weights = cfg.get('drpo_reward_weights', [1.0, 1.0])
+            drpo_num_clusters = cfg.get('drpo_num_clusters', 5)
+            drpo_epsilon = cfg.get('drpo_epsilon', 1e-4)
+            drpo_strict_mode = cfg.get('drpo_strict_mode', True)
+            
+            logging.info(f"  Reward weights: {drpo_reward_weights}")
+            logging.info(f"  Num clusters: {drpo_num_clusters}")
+            logging.info(f"  Epsilon: {drpo_epsilon}")
+            logging.info(f"  Strict mode: {drpo_strict_mode} (will RAISE ERRORS if fallback occurs)")
+            
+            grpo = DRPO(
+                clip_eps=cfg.get('rl_clip_eps', 0.2),
+                entropy_coef=cfg.get('rl_entropy_coef', 0.01),
+                kl_coef=cfg.get('rl_kl_coef', 0.01),
+                max_grad_norm=cfg.get('rl_max_grad_norm', 0.5),
+                normalize_advantages=cfg.get('rl_normalize_advantages', True),
+                num_samples_per_image=num_samples_per_image,
+                use_value_function=use_value_function,
+                value_coef=cfg.get('rl_value_coef', 0.5),
+                reward_weights=drpo_reward_weights,
+                num_clusters=drpo_num_clusters,
+                epsilon=drpo_epsilon,
+                strict_mode=drpo_strict_mode,
+            )
+        elif rl_mode == 'gdpo':
             # GDPO: Group reward-Decoupled normalization Policy Optimization
             if GDPO is None:
                 raise ImportError("GDPO not available. Please check medAI.modeling.gdpo import.")
@@ -241,6 +283,7 @@ def main(cfg):
         
         reward_computer = build_rl_reward_computer(cfg)
 
+
         # GDPO verification: ensure reward_computer can provide separate reward components
         if rl_mode == 'gdpo':
             if not hasattr(reward_computer, 'compute_reward_components'):
@@ -252,8 +295,21 @@ def main(cfg):
             logging.info("[GDPO] ✓ Verified: reward_computer has compute_reward_components method")
             logging.info("=" * 60)
         
+        # DRPO verification: same as GDPO, needs separate reward components
+        if rl_mode == 'drpo':
+            if not hasattr(reward_computer, 'compute_reward_components'):
+                raise AttributeError(
+                    "[DRPO ERROR] reward_computer does not have 'compute_reward_components' method!\n"
+                    "DRPO requires separate reward signals for hierarchical scaling.\n"
+                    "Make sure RLRewardComputer has compute_reward_components() method."
+                )
+            logging.info("[DRPO] ✓ Verified: reward_computer has compute_reward_components method")
+            logging.info("=" * 60)
+        
         if use_value_function:
             logging.info(f"RL mode: PPO with value function (value_coef={cfg.get('rl_value_coef', 0.5)})")
+        elif rl_mode == 'drpo':
+            logging.info(f"RL mode: DRPO with hierarchical advantage scaling")
         elif rl_mode == 'gdpo':
             logging.info(f"RL mode: GDPO with decoupled reward normalization")
         else:
@@ -321,6 +377,11 @@ def main(cfg):
             if cfg.get('save_checkpoint_wandb', False):
                 wandb.save(
                     os.path.join(cfg.checkpoint_dir, name),
+                    base_path=cfg.checkpoint_dir,
+                    policy="now",
+                )
+                wandb.save(
+                    os.path.join(cfg.checkpoint_dir, "config.yaml"),
                     base_path=cfg.checkpoint_dir,
                     policy="now",
                 )
@@ -560,10 +621,11 @@ def run_rl_train_epoch_batched(
     
     This is much faster on large GPUs.
     
-    Supports three RL modes:
+    Supports four RL modes:
     - PPO: Uses value function baseline
     - GRPO: Group-relative advantage without value function
     - GDPO: Decoupled reward normalization for multi-reward training
+    - DRPO: GDPO + hierarchical advantage scaling with domain clustering
     """
     model.train()
     evaluator = Evaluator(**args.evaluator)
@@ -572,12 +634,56 @@ def run_rl_train_epoch_batched(
     num_rl_updates = args.get('rl_num_update_epochs', 4)
     rl_mode = args.get('rl_mode', 'grpo').lower()
     use_gdpo = rl_mode == 'gdpo'
+    use_drpo = rl_mode == 'drpo'
 
     for train_iter, data in enumerate(tqdm(loader, desc=desc)):
 
         if args.debug and train_iter > 10:
             break
 
+        B = data['bmode'].shape[0]
+        
+        
+        # Generate domain IDs for DRPO (synthetic domains based on patient info)
+        # For unbalanced cancer data, we create domains based on cancer presence
+        # This helps DRPO balance learning between rare cancer cases and common benign cases
+        if use_drpo:
+            # Create domain based on cancer label (simple but effective for unbalanced data)
+            # Domain 0: Benign (common), Domain 1: Cancer (rare)
+            # This allows DRPO to upweight the rare cancer cases
+            grade_data = data.get('grade', None)
+            
+            if grade_data is None:
+                raise ValueError(
+                    "[DRPO ERROR] 'grade' field not found in data!\n"
+                    "DRPO requires grade information to create domains.\n"
+                    "Available keys: " + str(list(data.keys()))
+                )
+            
+            # Map grade strings to binary domains
+            # "Benign" -> 0, any cancer grade -> 1
+            # Supports both Grade Group (GG1-GG5) and Gleason Score (GS6-GS10) formats
+            domain_list = []
+            for g in grade_data:
+                if g == "Benign" or g == 0:
+                    domain_list.append(0)  # Benign domain
+                elif g in ["GG1", "GG2", "GG3", "GG4", "GG5"]:
+                    domain_list.append(1)  # Cancer domain (Grade Group)
+                elif g in ["GS6", "GS7", "GS8", "GS9", "GS10"]:
+                    domain_list.append(1)  # Cancer domain (Gleason Score)
+                elif isinstance(g, int) and g > 0:
+                    domain_list.append(1)  # Cancer domain (integer grade)
+                else:
+                    raise ValueError(
+                        f"[DRPO ERROR] Unknown grade value: '{g}'\n"
+                        f"Expected: 'Benign', 'GG1'-'GG5', 'GS6'-'GS10', or integers.\n"
+                        f"Got: {g} (type: {type(g)})"
+                    )
+            
+            domain_ids = torch.tensor(domain_list, dtype=torch.long).to(args.device)
+        else:
+            domain_ids = None
+        
         B = data['bmode'].shape[0]
         
         # ============================================
@@ -599,24 +705,24 @@ def run_rl_train_epoch_batched(
             rollout_action_indices = batched_outputs.get('rl_action_indices')
             
             # Compute rewards for all samples in one go
-            if use_gdpo:
-                # GDPO mode: get separate reward components for decoupled normalization
+            if use_gdpo or use_drpo:
+                # GDPO/DRPO mode: get separate reward components for decoupled normalization
                 all_rewards, reward_components = reward_computer.compute_reward_components(
                     batched_outputs, batched_data, num_samples_per_image=num_samples_per_image
                 )
                 
-                # Validate GDPO is working correctly
+                # Validate reward components
                 if reward_components is None or len(reward_components) == 0:
                     raise ValueError(
-                        "[GDPO ERROR] compute_reward_components returned empty reward_components!\n"
+                        f"[{rl_mode.upper()} ERROR] compute_reward_components returned empty reward_components!\n"
                         f"  reward_components: {reward_components}\n"
-                        "  GDPO requires at least 2 reward components. Check RLRewardComputer implementation."
+                        f"  {rl_mode.upper()} requires at least 2 reward components. Check RLRewardComputer implementation."
                     )
                 
-                # Log first iteration to verify GDPO is working
+                # Log first iteration to verify reward components are working
                 if train_iter == 0:
                     logging.info(
-                        f"[GDPO] First batch - Verified reward components:\n"
+                        f"[{rl_mode.upper()}] First batch - Verified reward components:\n"
                         f"  Number of components: {len(reward_components)}\n"
                         f"  Component 0 (classification): mean={reward_components[0].mean().item():.4f}, std={reward_components[0].std().item():.4f}\n"
                         f"  Component 1 (attention/ROI): mean={reward_components[1].mean().item():.4f}, std={reward_components[1].std().item():.4f}\n"
@@ -665,8 +771,19 @@ def run_rl_train_epoch_batched(
                 # Supervised loss (use mean over samples for stable training)
                 supervised_loss = criterion(current_outputs)
                 
-                # RL loss (GRPO, GDPO, or PPO depending on mode and value function)
-                if use_gdpo:
+                # RL loss (GRPO, GDPO, DRPO, or PPO depending on mode and value function)
+                if use_drpo:
+                    # DRPO: pass reward components AND domain_ids for hierarchical scaling
+                    rl_loss, rl_info = grpo.compute_loss(
+                        current_log_probs,
+                        old_log_probs,
+                        all_rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
+                        values=current_values,
+                        reward_components=[rc.detach() for rc in reward_components],  # DRPO needs separate components
+                        domain_ids=domain_ids,  # DRPO needs domain IDs for clustering and temperature scaling
+                    )
+                elif use_gdpo:
                     # GDPO: pass reward components for decoupled normalization
                     rl_loss, rl_info = grpo.compute_loss(
                         current_log_probs,

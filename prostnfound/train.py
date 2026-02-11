@@ -71,6 +71,7 @@ def main(cfg):
 
     if cfg.checkpoint_dir is not None:
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+        OmegaConf.save(cfg, os.path.join(cfg.checkpoint_dir, "config.yaml"), resolve=True)
         exp_state_path = os.path.join(cfg.checkpoint_dir, "experiment_state.pth")
         if os.path.exists(exp_state_path):
             logging.info("Loading experiment state from experiment_state.pth")
@@ -153,6 +154,11 @@ def main(cfg):
             if cfg.save_checkpoint_wandb:
                 wandb.save(
                     os.path.join(cfg.checkpoint_dir, name),
+                    base_path=cfg.checkpoint_dir,
+                    policy="now",
+                )
+                wandb.save(
+                    os.path.join(cfg.checkpoint_dir, "config.yaml"),
                     base_path=cfg.checkpoint_dir,
                     policy="now",
                 )

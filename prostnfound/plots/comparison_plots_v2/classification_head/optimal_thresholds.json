@@ -1,0 +1,62 @@
+{
+  "Supervised": {
+    "threshold_balanced_accuracy": 0.33,
+    "max_balanced_accuracy": 0.7388972751463062,
+    "threshold_f1": 0.51,
+    "max_f1": 0.49528301886792453,
+    "threshold_sensitivity": 0.15000000000000002,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.54,
+    "max_specificity": 0.9020122484689413
+  },
+  "PPO-old": {
+    "threshold_balanced_accuracy": 0.3,
+    "max_balanced_accuracy": 0.679774160354308,
+    "threshold_f1": 0.37,
+    "max_f1": 0.38461538461538464,
+    "threshold_sensitivity": 0.17,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.55,
+    "max_specificity": 0.9028871391076115
+  },
+  "PPO-v2": {
+    "threshold_balanced_accuracy": 0.25,
+    "max_balanced_accuracy": 0.7233487005834116,
+    "threshold_f1": 0.48000000000000004,
+    "max_f1": 0.4764044943820225,
+    "threshold_sensitivity": 0.09,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.55,
+    "max_specificity": 0.9011373578302713
+  },
+  "hybrid": {
+    "threshold_balanced_accuracy": 0.48000000000000004,
+    "max_balanced_accuracy": 0.7215399888485442,
+    "threshold_f1": 0.55,
+    "max_f1": 0.4608879492600423,
+    "threshold_sensitivity": 0.17,
+    "max_sensitivity": 0.9067357512953368,
+    "threshold_specificity": 0.66,
+    "max_specificity": 0.905511811023622
+  },
+  "roi_reward": {
+    "threshold_balanced_accuracy": 0.31,
+    "max_balanced_accuracy": 0.6727410369040657,
+    "threshold_f1": 0.39,
+    "max_f1": 0.37735849056603776,
+    "threshold_sensitivity": 0.18000000000000002,
+    "max_sensitivity": 0.9067357512953368,
+    "threshold_specificity": 0.55,
+    "max_specificity": 0.9046369203849519
+  },
+  "ProstNFound+": {
+    "threshold_balanced_accuracy": 0.09,
+    "max_balanced_accuracy": 0.659864731934415,
+    "threshold_f1": 0.11,
+    "max_f1": 0.3847980997624703,
+    "threshold_sensitivity": 0.05,
+    "max_sensitivity": 0.9378238341968912,
+    "threshold_specificity": 0.12,
+    "max_specificity": 0.9142607174103237
+  }
+}
