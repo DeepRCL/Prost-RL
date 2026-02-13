@@ -58,24 +58,63 @@ def main(args):
     else: 
         state = None
 
-    train_args = Namespace(**state["args"])
+    raw_train_args = state.get("args", {})
+    # Some older checkpoints (saved via vars(cfg)) serialize OmegaConf internals
+    # and store real values under "_content".
+    if isinstance(raw_train_args, dict) and "_content" in raw_train_args:
+        maybe_content = raw_train_args.get("_content")
+        if isinstance(maybe_content, dict):
+            raw_train_args = maybe_content
+
+    if isinstance(raw_train_args, dict):
+        train_args = Namespace(**raw_train_args)
+    elif isinstance(raw_train_args, Namespace):
+        train_args = raw_train_args
+    else:
+        # Keep test robust to unexpected checkpoint formats.
+        train_args = Namespace()
 
     # IMPORTANT: Always use the model config from the checkpoint
     # This ensures we load the correct RL model architecture
-    print(f"Checkpoint model: {train_args.model}")
-    print(f"Checkpoint model_kw: {train_args.model_kw}")
+    checkpoint_model = getattr(train_args, "model", None)
+    checkpoint_model_kw = getattr(train_args, "model_kw", None)
+
+    # Fallback path for legacy checkpoints without model metadata.
+    if checkpoint_model is None:
+        checkpoint_model = args.get("model", None)
+        print(
+            "Warning: checkpoint args has no `model`; using test-time `model` override."
+        )
+    if checkpoint_model_kw is None:
+        checkpoint_model_kw = args.get("model_kw", {})
+        print(
+            "Warning: checkpoint args has no `model_kw`; using test-time `model_kw` override."
+        )
+
+    if checkpoint_model is None:
+        raise ValueError(
+            "Could not resolve model architecture from checkpoint or test config. "
+            "Pass `model=...` in overrides."
+        )
+
+    print(f"Checkpoint model: {checkpoint_model}")
+    print(f"Checkpoint model_kw: {checkpoint_model_kw}")
     
     # Override test config with checkpoint's model config
-    args.model = train_args.model
+    args.model = checkpoint_model
     # Convert to plain dict to allow modification (OmegaConf struct mode blocks new keys)
-    model_kw = dict(train_args.model_kw)
+    model_kw = dict(checkpoint_model_kw or {})
     
-    # Detect legacy checkpoints that don't have policy_arch_version
-    # Legacy checkpoints used a simpler attention_map_head architecture
-    # NOTE: policy_arch_version is only for V1 RL models (prostnfound_rl), NOT V2 models (prostnfound_rl_v2)
-    is_v1_model = 'rl_v2' not in args.model  # V1 models don't have 'rl_v2' in their name
-    
-    if is_v1_model and 'policy_arch_version' not in model_kw:
+    # Detect legacy checkpoints that don't have policy_arch_version.
+    # IMPORTANT: policy_arch_version is RL-specific and only valid for V1 RL
+    # models (prostnfound_rl). It must NEVER be injected into baseline
+    # prostnfound models.
+    model_name = str(args.model)
+    is_rl_model_name = "prostnfound_rl" in model_name
+    is_v2_rl_model_name = "rl_v2" in model_name
+    is_v1_rl_model_name = is_rl_model_name and (not is_v2_rl_model_name)
+
+    if is_v1_rl_model_name and 'policy_arch_version' not in model_kw:
         # Check if this is a legacy checkpoint by inspecting the state dict
         has_legacy_arch = False
         for key in state.get("model", {}).keys():
@@ -93,10 +132,15 @@ def main(args):
         else:
             print("V1 architecture version not in checkpoint. Defaulting to 'v2'")
             model_kw['policy_arch_version'] = 'v2'
-    elif not is_v1_model:
+    elif is_v2_rl_model_name:
         # V2 models don't use policy_arch_version - remove it if present
         if 'policy_arch_version' in model_kw:
             print("Removing policy_arch_version from V2 model kwargs (not applicable)")
+            del model_kw['policy_arch_version']
+    else:
+        # Non-RL models must not carry RL-only arch keys.
+        if 'policy_arch_version' in model_kw:
+            print("Removing policy_arch_version from non-RL model kwargs (not applicable)")
             del model_kw['policy_arch_version']
     
     # Update args with the modified model_kw (use OmegaConf.update to handle struct mode)
@@ -163,16 +207,24 @@ def main(args):
         log_images=False, include_patient_metrics=args.get('include_patient_metrics', False)
     )
     accumulator = defaultdict(list)
+    # Track high prediction cases (used for logging/debug across model types)
+    high_prediction_cases = []
     
     # For RL models, also accumulate attention point statistics
     if is_rl_model:
         rl_accumulator = defaultdict(list)
         # For analysis: store per-core RL attention probabilities and coordinates
         rl_attention_point_records = []
-        # Track high prediction cases (for verification that model predicts cancer)
-        high_prediction_cases = []
 
     loader = loaders[args.split]
+
+    if len(loader) == 0:
+        data_cfg = args.get("data", {})
+        root_dir = data_cfg.get("root_dir", "<unknown>") if hasattr(data_cfg, "get") else "<unknown>"
+        raise ValueError(
+            f"Selected split '{args.split}' is empty. "
+            f"Check Optimum root_dir and cohort selection (root_dir={root_dir})."
+        )
 
     # warmup
     for _ in range(10):
@@ -492,7 +544,10 @@ def main(args):
         # Get grade group if available
         grade_group = None
         if "grade_group" in data:
-            grade_group = int(data["grade_group"][0].item())
+            gg_value = data["grade_group"][0].item()
+            # Optimum metadata may contain NaN grade groups for benign cores.
+            if gg_value is not None and not np.isnan(gg_value):
+                grade_group = int(gg_value)
         
         # Get classification score (from classification head)
         cls_score = None

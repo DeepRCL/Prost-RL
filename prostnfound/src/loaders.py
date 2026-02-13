@@ -304,10 +304,15 @@ def get_dataloaders(args, mode: Literal["train", "test", "heatmap"] = "train"):
             frames="first",
         )
 
+    # In test/heatmap modes we still return train/val/test loaders for API
+    # compatibility, but train split can legitimately be empty (e.g. Optimum
+    # evaluation-only cohorts). Avoid RandomSampler on empty datasets.
+    train_shuffle = (mode == "train") and (len(train_dataset) > 0)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size if mode == "train" else 1,
-        shuffle=True,
+        shuffle=train_shuffle,
         num_workers=args.num_workers,
         pin_memory=True,
     )

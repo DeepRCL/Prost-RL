@@ -1,0 +1,66 @@
+# Batch evaluation config for UA (Optimum) zero-shot testing.
+#
+# Fill model checkpoint paths below, then run:
+#   python test_ua_models.py --config cfg/test_ua_models.yaml
+
+python: python
+test_script: test_rl.py
+base_output_dir: outputs/ua_zeroshot_eval
+split: test
+fail_fast: false
+require_nonempty_optimum_root: true
+
+data:
+  dataset: optimum
+  cohort_selection_mode: all
+  root_dir: /data/project/prostate-us/processed/processed/processed/UA_annotated_needles # If null, script uses EXACTVU_PCA_DATA_ROOT/OPTIMUM/processed/UA_annotated_needles
+  batch_size: 8
+  num_workers: 8
+  augmentations: translate
+  image_size: 256
+  first_downsample_size: null
+  mask_size: 64
+  mean: [0, 0, 0]
+  std: [1, 1, 1]
+  flip_ud: false
+  frames: first
+  crop_to_prostate: false
+  rf_as_bmode: false
+  include_rf: false
+  train_subsample_seed: 42
+
+common_overrides:
+  - postprocess=true
+  - include_patient_metrics=true
+  - save_raw_heatmaps=false
+  - save_rendered_heatmaps=true
+  - save_format=png
+  - use_amp=false
+  - torch_compile=false
+  - apply_prostate_mask_to_decoder=true
+  - boundary_tolerance_patches=1
+
+models:
+  # - name: pnf_plus_baseline
+  #   enabled: true
+  #   checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_rl_v2/prostnfound+_v3/best.pth
+  #   output_subdir: pnf_plus_baseline
+  #   overrides: []
+
+  # - name: drpo_rl_symmetric_ce
+  #   enabled: true
+  #   checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_rl_v3/V3-DRPO-symmetric_ce/best_rl.pth
+  #   output_subdir: drpo_rl
+  #   overrides: []
+
+  # - name: V3-PPO-thresholded_involvement_entropy_reg
+  #   enabled: true
+  #   checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_rl_v3/V3-PPO-thresholded_involvement_entropy_reg/best_rl.pth
+  #   output_subdir: V3-PPO-thresholded_involvement_entropy_reg
+  #   overrides: []
+  
+  - name: V3-PNF-SUPERVISED-TopKMIL
+    enabled: true
+    checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_rl_v2/V3-PNF-SUPERVISED-TopKMIL/best_rl.pth
+    output_subdir: V3-PNF-SUPERVISED-TopKMIL
+    overrides: []
