@@ -195,6 +195,27 @@ class ProstNFoundTransform:
             elif np.isnan(item["family_history"]):
                 out["family_history"] = torch.tensor(0.)
 
+        # Positional prompts expected by models trained with prompts including
+        # "pos" (expanded to base_apex_encoding and mid_lateral_encoding).
+        # Works for NCT-style location codes (e.g. LBM, RAL) and Optimum
+        # Sample ID codes (e.g. RLM) where index 1 is base/mid/apex and index 2
+        # is mid/lateral.
+        if "base_apex_encoding" not in out or "mid_lateral_encoding" not in out:
+            loc = item.get("loc")
+            if isinstance(loc, str) and len(loc) >= 3:
+                code = loc.upper()
+                if "base_apex_encoding" not in out:
+                    if code[1] == "B":
+                        out["base_apex_encoding"] = torch.tensor([-1.0]).float()
+                    elif code[1] == "M":
+                        out["base_apex_encoding"] = torch.tensor([0.0]).float()
+                    else:
+                        out["base_apex_encoding"] = torch.tensor([1.0]).float()
+                if "mid_lateral_encoding" not in out:
+                    out["mid_lateral_encoding"] = torch.tensor(
+                        [1.0 if code[2] == "M" else -1.0]
+                    ).float()
+
         # misc
         if "center" in item:
             out["center"] = item["center"]
