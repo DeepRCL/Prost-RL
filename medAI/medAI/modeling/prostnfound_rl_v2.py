@@ -41,6 +41,7 @@ class ProstNFoundRLV2(nn.Module):
         use_value_function: bool = False,
         boundary_tolerance_patches: int = 1,  # Patches to dilate prostate mask (on 16x16 feature grid)
         detach_attention_for_decoder: bool = False,  # If True, policy trained ONLY by RL
+        attention_mode: Optional[str] = None,  # 'discrete', 'continuous', or 'bernoulli'
     ):
         super().__init__()
         
@@ -49,10 +50,23 @@ class ProstNFoundRLV2(nn.Module):
         self.use_clinical_in_policy = use_clinical_in_policy
         self.freeze_prostnfound = freeze_prostnfound
         self.use_prostate_mask_constraint = use_prostate_mask_constraint
-        self.discrete_attention = discrete_attention
         self.use_value_function = use_value_function
         self.boundary_tolerance_patches = boundary_tolerance_patches
         self.detach_attention_for_decoder = detach_attention_for_decoder
+
+        # Resolve attention_mode: new string API overrides old bool API
+        if attention_mode is not None:
+            if attention_mode not in ('discrete', 'continuous', 'bernoulli'):
+                raise ValueError(
+                    f"attention_mode must be 'discrete', 'continuous', or 'bernoulli', "
+                    f"got '{attention_mode}'"
+                )
+            self.attention_mode = attention_mode
+        else:
+            self.attention_mode = 'discrete' if discrete_attention else 'continuous'
+
+        # Keep legacy attribute for code that reads .discrete_attention directly
+        self.discrete_attention = (self.attention_mode == 'discrete')
         
         if freeze_prostnfound:
             logging.info("Freezing ProstNFound weights")
@@ -61,7 +75,7 @@ class ProstNFoundRLV2(nn.Module):
         
         feature_dim = 256
         
-        # Policy network
+        # Policy network — pass resolved attention_mode
         self.policy = PatchAttentionPolicy(
             feature_dim=feature_dim,
             hidden_dim=policy_hidden_dim,
@@ -69,8 +83,9 @@ class ProstNFoundRLV2(nn.Module):
             image_size=256,
             use_clinical_features=use_clinical_in_policy,
             use_prostate_mask_constraint=use_prostate_mask_constraint,
-            discrete_mode=discrete_attention,
+            discrete_mode=self.discrete_attention,  # legacy bool for compat
             boundary_tolerance_patches=boundary_tolerance_patches,
+            attention_mode=self.attention_mode,
         )
         
         # Value network (optional, for PPO)
@@ -78,7 +93,7 @@ class ProstNFoundRLV2(nn.Module):
             self.value_network = ValueNetwork(
                 feature_dim=feature_dim,
                 hidden_dim=policy_hidden_dim,
-                action_type='discrete' if discrete_attention else 'continuous',
+                action_type='discrete' if self.discrete_attention else 'continuous',
                 num_patches=num_attention_patches,
                 use_clinical_features=use_clinical_in_policy,
             )
@@ -87,13 +102,14 @@ class ProstNFoundRLV2(nn.Module):
         
         # Attention modulation layer for decoder
         # NOTE: Policy outputs features of size policy_hidden_dim, not feature_dim!
-        if discrete_attention:
+        if self.attention_mode == 'discrete':
             # For discrete: convert selected patch features to sparse embeddings
             # Input: policy_hidden_dim (from policy output), Output: 256 (SAM embedding size)
             self.attention_projection = nn.Linear(policy_hidden_dim, 256)
         else:
-            # For continuous: modulate dense embeddings with attention
+            # For continuous and bernoulli: modulate dense embeddings with attention map
             # Input channels: policy_hidden_dim (from policy output), Output: 256 (SAM embedding size)
+            # Both modes produce (B, hidden_dim, H, W) weighted features
             self.attention_modulation = nn.Sequential(
                 nn.Conv2d(policy_hidden_dim, 256, kernel_size=1),
                 nn.Tanh(),
@@ -101,10 +117,11 @@ class ProstNFoundRLV2(nn.Module):
         
         logging.info(
             f"Created ProstNFoundRLV2 with "
-            f"{'discrete' if discrete_attention else 'continuous'} attention, "
+            f"attention_mode='{self.attention_mode}', "
             f"{num_attention_patches} patches, "
             f"prostate_mask_constraint={use_prostate_mask_constraint}, "
-            f"use_value_function={use_value_function}"
+            f"use_value_function={use_value_function}, "
+            f"detach_attention_for_decoder={detach_attention_for_decoder}"
         )
     
     @property
@@ -221,14 +238,14 @@ class ProstNFoundRLV2(nn.Module):
         else:
             attention_features_for_decoder = attention_features
         
-        if self.discrete_attention:
+        if self.attention_mode == 'discrete':
             # Discrete: Add selected patch features as sparse embeddings
             # attention_features: (B, k, C)
             patch_embeddings = self.attention_projection(attention_features_for_decoder)  # B x k x 256
             sparse_embedding = torch.cat([sparse_embedding, patch_embeddings], dim=1)
         else:
-            # Continuous: Modulate dense embeddings with attention
-            # attention_features: (B, C, H, W)
+            # Continuous / Bernoulli: Modulate dense embeddings with attention map
+            # Both produce (B, hidden_dim, H, W) weighted features
             attention_modulation = self.attention_modulation(attention_features_for_decoder)  # B x 256 x H x W
             dense_embedding = dense_embedding + attention_modulation
         
@@ -375,7 +392,12 @@ class ProstNFoundRLV2(nn.Module):
             warmup_parameters = list(self.policy.parameters())
             if self.value_network is not None:
                 warmup_parameters += list(self.value_network.parameters())
-            warmup_parameters += list(self.attention_projection.parameters() if self.discrete_attention else self.attention_modulation.parameters())
+            proj_params = (
+                self.attention_projection.parameters()
+                if self.attention_mode == 'discrete'
+                else self.attention_modulation.parameters()
+            )
+            warmup_parameters += list(proj_params)
             cnn_parameters = []
         else:
             encoder_parameters, warmup_parameters, cnn_parameters = (
@@ -384,7 +406,12 @@ class ProstNFoundRLV2(nn.Module):
             warmup_parameters = list(warmup_parameters) + list(self.policy.parameters())
             if self.value_network is not None:
                 warmup_parameters += list(self.value_network.parameters())
-            warmup_parameters += list(self.attention_projection.parameters() if self.discrete_attention else self.attention_modulation.parameters())
+            proj_params = (
+                self.attention_projection.parameters()
+                if self.attention_mode == 'discrete'
+                else self.attention_modulation.parameters()
+            )
+            warmup_parameters += list(proj_params)
         
         return encoder_parameters, warmup_parameters, cnn_parameters
 
@@ -403,6 +430,7 @@ def prostnfound_rl_v2_adapter_medsam(
     use_value_function: bool = False,
     boundary_tolerance_patches: int = 1,
     detach_attention_for_decoder: bool = False,
+    attention_mode: str = None,  # 'discrete', 'continuous', or 'bernoulli'
     prostnfound_kw: dict = {},
     **kwargs,
 ):
@@ -450,6 +478,7 @@ def prostnfound_rl_v2_adapter_medsam(
         use_value_function=use_value_function,
         boundary_tolerance_patches=boundary_tolerance_patches,
         detach_attention_for_decoder=detach_attention_for_decoder,
+        attention_mode=attention_mode,
     )
     
     return model
@@ -470,6 +499,7 @@ def prostnfound_rl_v2_adapter_medsam_legacy(
     use_value_function: bool = False,
     boundary_tolerance_patches: int = 1,
     detach_attention_for_decoder: bool = False,
+    attention_mode: str = None,  # 'discrete', 'continuous', or 'bernoulli'
     **kwargs,
 ):
     """
@@ -493,6 +523,7 @@ def prostnfound_rl_v2_adapter_medsam_legacy(
         use_value_function=use_value_function,
         boundary_tolerance_patches=boundary_tolerance_patches,
         detach_attention_for_decoder=detach_attention_for_decoder,
+        attention_mode=attention_mode,
         prostnfound_kw={'use_class_decoder': use_class_decoder},
         **kwargs,
     )

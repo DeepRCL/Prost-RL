@@ -1,0 +1,155 @@
+# =============================================================================
+# ProstNFound-RL — Bernoulli Attention + DRPO
+# =============================================================================
+#
+# Attention mode: 'bernoulli'
+# ─────────────────────────────────────────────────────────────────────────────
+# The policy produces a 16×16 sigmoid probability map.  During each rollout a
+# *binary mask* is sampled independently per patch from Bernoulli(p_i).  The
+# gated features (features * mask) are projected to 256-d and added to the
+# decoder's dense embedding — same dense-modulation path as the continuous
+# mode, but with genuine stochasticity that makes GRPO advantages non-trivial.
+#
+# Why this beats the continuous baseline:
+#   • softmax (continuous) creates a zero-sum competition → all rollouts look
+#     almost identical → GRPO advantage ≈ 0 → no learning signal.
+#   • Bernoulli samples each patch independently → different rollouts select
+#     structurally different subsets of features → real reward variance →
+#     GRPO works as intended.
+#
+# Inference (deterministic=True):
+#   • No sampling: the sigmoid probabilities are used directly as a smooth
+#     continuous gate (same expressiveness as the trained continuous mode).
+#
+# log_prob:
+#   • mean of per-patch Bernoulli log-probs (not sum).  Sum over 256 patches
+#     would produce very large magnitudes and destabilise GRPO normalisation.
+# =============================================================================
+
+name: "V3-DRPO-bernoulli-thresholded_involvement_entropy_reg"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 8
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# ---------------------------------------------------------------------------
+# Model — same backbone as noise_robust_drpo, only attention_mode changes
+# ---------------------------------------------------------------------------
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4      # kept for compat; not used in bernoulli mode
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ attention_mode: bernoulli      # <── KEY CHANGE
+ # discrete_attention is ignored when attention_mode is set explicitly
+ use_value_function: false      # DRPO is GRPO-based, no value function
+ upsample: false
+ boundary_tolerance_patches: 2
+ detach_attention_for_decoder: false
+
+# ---------------------------------------------------------------------------
+# Loss
+# ---------------------------------------------------------------------------
+loss: thresholded_involvement_entropy_reg
+loss_kw:
+  threshold: 0.5
+  soft_temperature: 0.1
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# ---------------------------------------------------------------------------
+# RL — DRPO
+# ---------------------------------------------------------------------------
+use_rl: true
+rl_mode: drpo
+
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+rl_reward_mode: classification_only
+rl_cspca_bonus: 2
+
+# GRPO/DRPO hyperparameters
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.05   # Slightly higher than continuous — encourages the
+                         # Bernoulli distribution to stay away from 0/1 extremes
+                         # and maintain meaningful stochasticity across rollouts.
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+
+# DRPO hierarchical scaling
+drpo_reward_weights: [1.0, 1.0]
+drpo_num_clusters: 5
+drpo_epsilon: 1.0e-4
+drpo_strict_mode: true
+
+rl_benign_sparsity_penalty_weight: 0.0
+
+# ---------------------------------------------------------------------------
+# Optimizer
+# ---------------------------------------------------------------------------
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 1.0e-05
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.001
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+
+tracked_metric: val/core_auc_high_involvement
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

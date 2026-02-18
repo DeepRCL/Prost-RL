@@ -1,0 +1,161 @@
+# =============================================================================
+# ProstNFound-RL — Bernoulli Attention + DRPO + Combined Reward (cls + heatmap)
+# =============================================================================
+#
+# Identical to bernoulli_drpo.yaml with ONE change:
+#
+#   rl_reward_mode: combined_v2          ← uses both reward signals
+#   rl_classification_reward_weight: 1.5 ← classification dominates
+#   rl_heatmap_reward_weight: 0.5        ← heatmap involvement is secondary
+#   drpo_reward_weights: [1.5, 0.5]      ← same ratio at DRPO component level
+#
+# What combined_v2 adds over classification_only
+# ─────────────────────────────────────────────────────────────────────────────
+# classification_only (bernoulli_drpo.yaml):
+#   reward = confidence of classification head on the correct class
+#   → policy learns to attend wherever helps classify the image
+#
+# combined_v2 (this file):
+#   reward = 1.5 * cls_reward + 0.5 * roi_reward
+#   roi_reward = 1 - |mean_pred_in_needle - true_involvement|
+#   → policy ALSO learns to produce heatmap values that match the true
+#     cancer involvement fraction in the needle region
+#   → spatial supervision signal without requiring pixel-level labels
+#
+# The 1.5 / 0.5 split keeps classification as the primary objective while
+# giving the spatial heatmap signal enough weight to shape the attention.
+#
+# DRPO decoupled normalisation:
+#   drpo_reward_weights controls the post-normalisation combination.
+#   Because DRPO normalises each component SEPARATELY (decoupled), the
+#   weights here apply to already-normalised advantages — so [1.5, 0.5]
+#   means "classification advantage matters 3× more than heatmap advantage".
+# =============================================================================
+
+name: "V3-DRPO-bernoulli-combined-reward-thresholded_involvement_entropy_reg"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 8
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# ---------------------------------------------------------------------------
+# Model — identical to bernoulli_drpo.yaml
+# ---------------------------------------------------------------------------
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ attention_mode: bernoulli
+ use_value_function: false
+ upsample: false
+ boundary_tolerance_patches: 2
+ detach_attention_for_decoder: false
+
+# ---------------------------------------------------------------------------
+# Loss — identical to bernoulli_drpo.yaml
+# ---------------------------------------------------------------------------
+loss: thresholded_involvement_entropy_reg
+loss_kw:
+  threshold: 0.5
+  soft_temperature: 0.1
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# ---------------------------------------------------------------------------
+# RL — DRPO with combined reward
+# ---------------------------------------------------------------------------
+use_rl: true
+rl_mode: drpo
+
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+rl_reward_mode: combined_v2          # <── KEY CHANGE 1: both reward signals
+rl_classification_reward_weight: 1.5 # <── KEY CHANGE 2: cls dominates
+rl_heatmap_reward_weight: 0.5        # <── KEY CHANGE 3: heatmap is secondary
+rl_cspca_bonus: 2
+
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.05
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+
+# DRPO component weights mirror the reward weights above.
+# Components are normalised separately by DRPO before being combined,
+# so [1.5, 0.5] scales classification advantage 3× vs heatmap advantage.
+drpo_reward_weights: [1.5, 0.5]
+drpo_num_clusters: 5
+drpo_epsilon: 1.0e-4
+drpo_strict_mode: true
+
+rl_benign_sparsity_penalty_weight: 0.0
+
+# ---------------------------------------------------------------------------
+# Optimizer — identical to bernoulli_drpo.yaml
+# ---------------------------------------------------------------------------
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 1.0e-05
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.001
+epochs: 25
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+
+tracked_metric: val/core_auc_high_involvement
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

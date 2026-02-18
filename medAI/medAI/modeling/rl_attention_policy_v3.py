@@ -13,9 +13,15 @@ class PatchAttentionPolicy(nn.Module):
     """
     Policy that outputs patch-level attention and passes it correctly to decoder.
     
-    Two modes:
-    1. Discrete: Sample k patches from distribution
-    2. Continuous: Use full attention map
+    Three modes controlled by ``attention_mode``:
+    1. ``'discrete'``: Sample k patches from a categorical distribution without replacement.
+    2. ``'continuous'``: Use a softmax-weighted sum over the full 16x16 feature map
+       (fully differentiable, no stochasticity).
+    3. ``'bernoulli'``: Sigmoid probabilities over the 16x16 grid → sample a **binary mask**
+       from independent Bernoulli distributions.  Each patch is selected/deselected
+       independently, so different rollouts produce structurally different masks, giving
+       GRPO real within-group reward variance.  At deterministic inference the binary mask
+       is replaced by the raw sigmoid probabilities (smooth continuous gate).
     
     Args:
         feature_dim: Input feature dimension (256)
@@ -24,7 +30,9 @@ class PatchAttentionPolicy(nn.Module):
         image_size: Image size (default: 256)
         use_clinical_features: Use clinical features (default: True)
         use_prostate_mask_constraint: Constrain to prostate (default: True)
-        discrete_mode: If True, sample k patches; if False, use continuous attention (default: True)
+        attention_mode: One of 'discrete', 'continuous', 'bernoulli' (default: 'discrete').
+        discrete_mode: *Deprecated* bool alias kept for backward compat.  If
+            ``attention_mode`` is explicitly passed, ``discrete_mode`` is ignored.
     """
     
     def __init__(
@@ -37,6 +45,7 @@ class PatchAttentionPolicy(nn.Module):
         use_prostate_mask_constraint: bool = True,
         discrete_mode: bool = True,
         boundary_tolerance_patches: int = 1,  # Patches to dilate prostate mask (on 16x16 feature grid)
+        attention_mode: Optional[str] = None,  # 'discrete', 'continuous', or 'bernoulli'
     ):
         super().__init__()
         
@@ -46,8 +55,22 @@ class PatchAttentionPolicy(nn.Module):
         self.image_size = image_size
         self.use_clinical_features = use_clinical_features
         self.use_prostate_mask_constraint = use_prostate_mask_constraint
-        self.discrete_mode = discrete_mode
         self.boundary_tolerance_patches = boundary_tolerance_patches
+
+        # Resolve attention_mode (new API) vs discrete_mode (deprecated bool API)
+        if attention_mode is not None:
+            if attention_mode not in ('discrete', 'continuous', 'bernoulli'):
+                raise ValueError(
+                    f"attention_mode must be 'discrete', 'continuous', or 'bernoulli', "
+                    f"got '{attention_mode}'"
+                )
+            self.attention_mode = attention_mode
+        else:
+            # Backward-compat: map bool discrete_mode to string
+            self.attention_mode = 'discrete' if discrete_mode else 'continuous'
+        
+        # Keep legacy attribute so old code that reads .discrete_mode still works
+        self.discrete_mode = (self.attention_mode == 'discrete')
         
         # Simplified feature processor (2 layers)
         self.feature_processor = nn.Sequential(
@@ -144,14 +167,21 @@ class PatchAttentionPolicy(nn.Module):
         # Clamp for numerical stability
         attention_logits = torch.clamp(attention_logits, min=-50.0, max=50.0)
         
-        if self.discrete_mode:
-            # Discrete mode: Sample k patches
+        if self.attention_mode == 'discrete':
+            # Discrete mode: Sample k patches without replacement
             return self._discrete_forward(
                 features, attention_logits, attention_map, B, H, W,
                 deterministic, action_indices, return_action_indices
             )
+        elif self.attention_mode == 'bernoulli':
+            # Bernoulli mode: independent binary mask per patch
+            return self._bernoulli_forward(
+                features, attention_logits, attention_map, B, H, W,
+                deterministic, action_indices, return_action_indices,
+                prostate_mask_dilated
+            )
         else:
-            # Continuous mode: Use full attention map with mask applied
+            # Continuous mode: softmax-weighted sum (fully deterministic)
             return self._continuous_forward(
                 features, attention_logits, attention_map, B, H, W,
                 prostate_mask_dilated
@@ -229,7 +259,80 @@ class PatchAttentionPolicy(nn.Module):
             viz_attention_map = viz_attention_map * prostate_mask_dilated
         
         return weighted_features, policy_log_prob.unsqueeze(1), viz_attention_map, None, None
-    
+
+    def _bernoulli_forward(
+        self,
+        features: torch.Tensor,
+        attention_logits: torch.Tensor,
+        attention_map: torch.Tensor,
+        B: int, H: int, W: int,
+        deterministic: bool,
+        action_indices: Optional[torch.Tensor],
+        return_action_indices: bool,
+        prostate_mask_dilated: Optional[torch.Tensor] = None,
+    ):
+        """
+        Bernoulli sampling over the 16x16 patch grid.
+
+        Each patch is independently included/excluded via a Bernoulli draw, breaking
+        the zero-sum competition of softmax (which makes continuous rollouts nearly
+        identical and kills GRPO's advantage signal).
+
+        Training:  sample a binary mask M ~ Bernoulli(sigmoid(logits))
+        Inference: use sigmoid(logits) directly as a smooth continuous gate
+                   (no sampling, fully deterministic)
+        Replay:    when ``action_indices`` (the stored mask) is passed, recompute
+                   log_prob of that exact mask under the *current* policy — needed
+                   for multi-epoch GRPO update steps.
+
+        log_prob is computed as the MEAN (not sum) of per-patch Bernoulli log-probs.
+        Summing 256 terms would produce extremely large magnitudes and destabilise
+        GRPO normalisation; mean keeps it in the same numerical range as discrete mode.
+
+        Returns:
+            weighted_features : (B, hidden_dim, H, W)  features gated by the mask
+            log_prob           : (B, 1)                 mean Bernoulli log-prob
+            viz_map            : (B, 1, H, W)           sigmoid probs (for visualisation)
+            None               : value (not used here)
+            action_indices_out : (B, H*W) float binary mask, or None
+        """
+        # Sigmoid probabilities — independent per patch, no competition
+        # attention_logits already has -inf applied outside prostate (from forward())
+        # Replace -inf with 0 so sigmoid(-inf)=0 (patch excluded deterministically)
+        safe_logits = attention_logits.clone()
+        safe_logits[safe_logits == float('-inf')] = -50.0  # sigmoid(-50) ≈ 0
+        probs_flat = torch.sigmoid(safe_logits)  # B x (H*W)
+
+        # Build Bernoulli distribution
+        dist = torch.distributions.Bernoulli(probs=probs_flat)
+
+        if action_indices is not None:
+            # Replay path: recompute log_prob of stored mask under current policy
+            mask_flat = action_indices.float().to(probs_flat.device)  # B x (H*W)
+        elif deterministic:
+            # Inference path: threshold → hard mask (equivalent to expected action)
+            mask_flat = (probs_flat > 0.5).float()  # B x (H*W)
+        else:
+            # Training path: stochastic sample
+            mask_flat = dist.sample()  # B x (H*W)
+
+        # Mean log-prob across spatial positions for numerical stability
+        # dist.log_prob returns (B, H*W); mean over H*W → (B,)
+        log_prob = dist.log_prob(mask_flat).mean(dim=1, keepdim=True)  # B x 1
+
+        # Reshape binary mask to spatial and gate features
+        mask_2d = mask_flat.view(B, 1, H, W)           # B x 1 x H x W
+        weighted_features = features * mask_2d          # B x hidden_dim x H x W
+
+        # Visualisation map: smooth sigmoid probabilities (not binary mask)
+        viz_map = probs_flat.view(B, 1, H, W)
+        if prostate_mask_dilated is not None:
+            viz_map = viz_map * prostate_mask_dilated
+
+        action_indices_out = mask_flat if return_action_indices else None
+
+        return weighted_features, log_prob, viz_map, None, action_indices_out
+
     def _compute_log_probs_for_indices(self, logits: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         """Compute log probs for given indices (without replacement)."""
         B, num_locs = logits.shape

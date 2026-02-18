@@ -1,0 +1,153 @@
+# =============================================================================
+# ProstNFound-RL — Bernoulli Attention + DRPO + Detached Policy
+# =============================================================================
+#
+# Identical to bernoulli_drpo.yaml with ONE change:
+#
+#   detach_attention_for_decoder: true   ← KEY DIFFERENCE
+#
+# What this tests
+# ─────────────────────────────────────────────────────────────────────────────
+# With detach=false (bernoulli_drpo.yaml):
+#   • Supervised loss gradient flows through the attention → policy
+#   • Both supervised and DRPO reward train the policy simultaneously
+#   • Can't claim RL is the only supervisor of WHERE to attend
+#
+# With detach=true (this file):
+#   • Decoder gradient is BLOCKED before the attention features
+#   • The policy receives ZERO supervised gradient
+#   • DRPO reward is the ONLY signal that teaches the policy where to focus
+#   • This is the clean RL argument for the paper (analogous to RLHF)
+#   • Bernoulli stochasticity is essential here: without real rollout variance
+#     (which continuous mode lacks), a reward-only policy barely learns
+#
+# Expected outcomes vs bernoulli_drpo (detach=false):
+#   • If equal/better  → strong claim: "RL alone learns a better attention policy"
+#   • If worse         → supervised leakage was helping; discuss the trade-off
+#                        and keep detach=false as the practical setting
+#
+# Both configs run in parallel on separate GPUs for a clean ablation.
+# =============================================================================
+
+name: "V3-DRPO-bernoulli-detached-thresholded_involvement_entropy_reg"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 8
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ attention_mode: bernoulli
+ use_value_function: false
+ upsample: false
+ boundary_tolerance_patches: 2
+ detach_attention_for_decoder: true   # <── KEY CHANGE vs bernoulli_drpo.yaml
+
+# ---------------------------------------------------------------------------
+# Loss — identical to bernoulli_drpo.yaml
+# ---------------------------------------------------------------------------
+loss: thresholded_involvement_entropy_reg
+loss_kw:
+  threshold: 0.5
+  soft_temperature: 0.1
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# ---------------------------------------------------------------------------
+# RL — DRPO, identical to bernoulli_drpo.yaml
+# ---------------------------------------------------------------------------
+use_rl: true
+rl_mode: drpo
+
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+rl_reward_mode: classification_only
+rl_cspca_bonus: 2
+
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.05
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+
+drpo_reward_weights: [1.0, 1.0]
+drpo_num_clusters: 5
+drpo_epsilon: 1.0e-4
+drpo_strict_mode: true
+
+rl_benign_sparsity_penalty_weight: 0.0
+
+# ---------------------------------------------------------------------------
+# Optimizer — identical to bernoulli_drpo.yaml
+# ---------------------------------------------------------------------------
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 1.0e-05
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.001
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+
+tracked_metric: val/core_auc_high_involvement
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100
