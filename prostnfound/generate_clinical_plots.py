@@ -369,15 +369,17 @@ def plot_error_by_involvement(data, score_col, head_label, subgroup, variant_lab
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLF head: Accuracy by involvement bins
-# For each bin: cancer cores in that range + ALL benign cores in subgroup
-# This gives a meaningful balanced-accuracy measurement per involvement level.
-# For high_inv / cspca subgroups, bins start at 40% (lower bins are trivial).
-# "Overall" bar always uses balanced accuracy regardless of the `balanced` flag.
+#
+# Each bin = all cores with involvement in [lo, hi).
+# Benign cores (involvement≈0) land naturally in the 0–20% bin.
+# Higher bins (≥20%) are cancer-dominated, so accuracy ≈ sensitivity there.
+# "Overall" bar always uses balanced_accuracy_score (benign >> cancer globally).
+# For high_inv / cspca subgroups, involvement bins start at 40%.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_accuracy_by_involvement(data, score_col, subgroup, out_dir, fname,
                                  balanced=False, fixed_thresh=None):
-    # Choose involvement bins depending on subgroup
+    # Bins: for focused subgroups skip trivial low-involvement range
     if subgroup in ("high_inv", "cspca"):
         inv_bins = [(0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]
     else:
@@ -385,9 +387,9 @@ def plot_accuracy_by_involvement(data, score_col, subgroup, out_dir, fname,
     all_bins = inv_bins + [(0.0, 1.0)]
     x = np.arange(len(all_bins))
     n = len(data); width = 0.8 / n
-    fig, ax = plt.subplots(figsize=(max(9, len(all_bins)*2), 6))
+    fig, ax = plt.subplots(figsize=(max(9, len(all_bins) * 2), 6))
 
-    # Compute per-model thresholds
+    # Compute per-model thresholds on FULL dataset for a fair comparison
     if fixed_thresh is not None:
         opt_thresh = {name: fixed_thresh for name in data}
         thresh_legend = f"fixed t={fixed_thresh:.2f}"
@@ -395,8 +397,8 @@ def plot_accuracy_by_involvement(data, score_col, subgroup, out_dir, fname,
         opt_thresh = {}
         for name, df in data.items():
             if score_col not in df.columns: continue
-            sub = df.dropna(subset=[score_col, "label"])
-            t, _ = _opt_threshold(sub["label"].values, sub[score_col].values, "balanced_accuracy")
+            full = df.dropna(subset=[score_col, "label"])
+            t, _ = _opt_threshold(full["label"].values, full[score_col].values, "balanced_accuracy")
             opt_thresh[name] = t
         thresh_legend = "optimal t"
 
@@ -404,65 +406,60 @@ def plot_accuracy_by_involvement(data, score_col, subgroup, out_dir, fname,
     for i, (name, df) in enumerate(data.items()):
         if score_col not in df.columns: continue
         t = opt_thresh.get(name, 0.5)
-        # All benign in this subgroup (they appear in every bin as the negative class)
-        sub_all = _subgroup(df, subgroup).dropna(subset=[score_col, "label"])
-        benign_pool = sub_all[sub_all["label"] == 0]
-        cancer_pool = sub_all[sub_all["label"] == 1].dropna(subset=["involvement"])
+        sub = _subgroup(df, subgroup).dropna(subset=[score_col, "label", "involvement"])
         accs = []
         for lo, hi in all_bins:
             if (lo, hi) == (0.0, 1.0):
-                b = sub_all  # Overall: all cores in subgroup
-                yp = (b[score_col].values >= t).astype(int)
-                # Overall always uses balanced accuracy
-                accs.append(balanced_accuracy_score(b["label"].values, yp) * 100)
-            else:
-                cancer_bin = cancer_pool[
-                    (cancer_pool["involvement"] >= lo) & (cancer_pool["involvement"] < hi)]
-                b = pd.concat([cancer_bin, benign_pool], ignore_index=True)
-                if len(b) < 2 or len(cancer_bin) == 0:
+                b = sub
+                if len(b) < 2 or len(np.unique(b["label"].values)) < 2:
                     accs.append(np.nan); continue
                 yp = (b[score_col].values >= t).astype(int)
-                if balanced:
+                # Overall always uses balanced accuracy to account for class imbalance
+                accs.append(balanced_accuracy_score(b["label"].values, yp) * 100)
+            else:
+                b = sub[(sub["involvement"] >= lo) & (sub["involvement"] < hi)]
+                if len(b) < 2:
+                    accs.append(np.nan); continue
+                yp = (b[score_col].values >= t).astype(int)
+                has_both = len(np.unique(b["label"].values)) > 1
+                if balanced and has_both:
                     accs.append(balanced_accuracy_score(b["label"].values, yp) * 100)
                 else:
                     accs.append(accuracy_score(b["label"].values, yp) * 100)
-        offset = (i - n/2 + 0.5) * width
-        bars = ax.bar(x + offset, accs, width=width*0.9, color=_c(i),
+        offset = (i - n / 2 + 0.5) * width
+        bars = ax.bar(x + offset, accs, width=width * 0.9, color=_c(i),
                       alpha=0.85, label=f"{name} (t={t:.2f})", edgecolor="white", lw=0.5)
         for bar, v in zip(bars, accs):
             if not np.isnan(v):
-                ax.text(bar.get_x()+bar.get_width()/2, v+0.5, f"{v:.1f}",
+                ax.text(bar.get_x() + bar.get_width() / 2, v + 0.5, f"{v:.1f}",
                         ha="center", va="bottom", fontsize=6, rotation=45, color=_c(i))
 
-    xlbls = [f"{int(lo*100)}–{int(hi*100)}%" for lo, hi in inv_bins] + ["Overall\n(bal. acc)"]
+    xlbls = [f"{int(lo*100)}\u2013{int(hi*100)}%" for lo, hi in inv_bins] + ["Overall\n(bal.acc)"]
     ax.set_xticks(x); ax.set_xticklabels(xlbls, fontsize=9)
     ax.axvline(len(inv_bins) - 0.5, color="gray", ls="--", lw=0.8, alpha=0.5)
 
-    # Sample counts from first model (benign pool + cancer per bin)
-    fsub = _subgroup(first_df, subgroup)
-    f_benign = fsub[fsub["label"] == 0]
-    f_cancer = fsub[fsub["label"] == 1].dropna(subset=["involvement"])
+    # Sample counts from first model
+    fsub = _subgroup(first_df, subgroup).dropna(subset=["involvement"])
     for j, (lo, hi) in enumerate(all_bins):
-        if (lo, hi) == (0.0, 1.0):
-            nb = len(fsub)
-        else:
-            nb = len(f_benign) + len(f_cancer[(f_cancer["involvement"] >= lo) & (f_cancer["involvement"] < hi)])
-        ax.annotate(f"n={nb}", xy=(j, 0), xycoords=("data", "axes fraction"),
-                    xytext=(0, -25), textcoords="offset points",
+        b = fsub if (lo, hi) == (0.0, 1.0) else fsub[
+            (fsub["involvement"] >= lo) & (fsub["involvement"] < hi)]
+        ax.annotate(f"n={len(b)}", xy=(j, 0), xycoords=("data", "axes fraction"),
+                    xytext=(0, -22), textcoords="offset points",
                     ha="center", va="top", fontsize=7, color="gray")
 
     metric_name = "Balanced Accuracy" if balanced else "Accuracy"
     suffix = f" [{thresh_legend}]"
-    ax.set_xlabel("True Involvement Range (Cancer Cores)", fontsize=11)
-    ax.set_ylabel(f"{metric_name} (%) — Overall=Balanced", fontsize=11)
-    ax.set_title(f"{metric_name} by Involvement — {GRPLABEL[subgroup]}\n"
-                 f"Classification Head{suffix}", fontsize=11, fontweight="bold")
+    ax.set_xlabel("True Involvement Range", fontsize=11)
+    ax.set_ylabel(f"{metric_name} (%)", fontsize=11)
+    ax.set_title(f"{metric_name} by Involvement \u2014 {GRPLABEL[subgroup]}\n"
+                 f"Classification Head{suffix}\n"
+                 "(bins \u226520%: cancer-only \u2192 value = sensitivity at that level)",
+                 fontsize=10, fontweight="bold")
     ax.set_ylim(0, 115)
     ax.legend(fontsize=8, framealpha=0.88)
     ax.grid(True, axis="y", alpha=0.22)
     plt.tight_layout()
     save(fig, out_dir, fname)
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLF head: Threshold analysis — balanced accuracy + F1 vs threshold
