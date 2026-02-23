@@ -1,0 +1,139 @@
+# =============================================================================
+# ProstNFound-RL — Bernoulli Score-Weighted, tracked on combined_high_inv_auc
+# =============================================================================
+#
+# Identical to bernoulli_drpo_score_weighted.yaml with ONE change:
+#
+#   tracked_metric: val/combined_high_inv_auc
+#
+# What combined_high_inv_auc is:
+#
+#   combined_high_inv_auc = core_auc_high_involvement        (heatmap head)
+#                         + core_auc_image_level_high_inv    (classification head)
+#
+#   Both terms are AUC-ROC computed on the SAME subset:
+#     - Cancer cores with involvement > 40%   (unambiguous high-grade cancer)
+#     - Benign cores
+#   Low-involvement ambiguous cancer is excluded from both.
+#
+#   Range: [0, 2].  Both heads perfect → 2.0.  Both random → 1.0.
+#   The checkpoint with the highest sum is saved.
+#
+#   Why this matters:
+#     • core_auc_high_involvement    → does the spatial HEATMAP correctly fire
+#                                      inside the needle for bad cancers?
+#     • core_auc_image_level_high_inv → does the classification HEAD correctly
+#                                       separate high-involvement cancer from benign?
+#   Tracking their sum forces the model to improve both simultaneously.
+# =============================================================================
+
+name: "V3-DRPO-bernoulli-combined-high-inv"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 8
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ attention_mode: bernoulli
+ use_value_function: false
+ upsample: false
+ boundary_tolerance_patches: 1
+ detach_attention_for_decoder: false
+
+loss: thresholded_involvement_entropy_reg
+loss_kw:
+  threshold: 0.5
+  soft_temperature: 0.1
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+use_rl: true
+rl_mode: drpo
+
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+rl_reward_mode: classification_only
+rl_cspca_bonus: 2
+
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.01
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+
+drpo_reward_weights: [1.0, 1.0]
+drpo_num_clusters: 3
+drpo_epsilon: 1.0e-4
+drpo_strict_mode: true
+
+rl_benign_sparsity_penalty_weight: 0.0
+
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 1.0e-05
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.001
+epochs: 30
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+
+tracked_metric: val/combined_high_inv_auc
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

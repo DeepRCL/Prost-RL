@@ -1,0 +1,42 @@
+{
+  "V3-DRPO-continuous-noise-FST-combined\n": {
+    "threshold_balanced_accuracy": 0.2,
+    "max_balanced_accuracy": 0.7464358405976455,
+    "threshold_f1": 0.24000000000000002,
+    "max_f1": 0.4823529411764706,
+    "threshold_sensitivity": 0.05,
+    "max_sensitivity": 0.9067357512953368,
+    "threshold_specificity": 0.38,
+    "max_specificity": 0.9028871391076115
+  },
+  "V3-DRPO-continuous-noise-0.3": {
+    "threshold_balanced_accuracy": 0.16,
+    "max_balanced_accuracy": 0.7355677042960304,
+    "threshold_f1": 0.31,
+    "max_f1": 0.46228710462287104,
+    "threshold_sensitivity": 0.05,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.34,
+    "max_specificity": 0.9011373578302713
+  },
+  "V3-PPO-thresholded_involvement_entropy_reg": {
+    "threshold_balanced_accuracy": 0.08,
+    "max_balanced_accuracy": 0.7277911504585243,
+    "threshold_f1": 0.13,
+    "max_f1": 0.4572564612326044,
+    "threshold_sensitivity": 0.03,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.22,
+    "max_specificity": 0.9011373578302713
+  },
+  "ProstNFound+v2": {
+    "threshold_balanced_accuracy": 0.16,
+    "max_balanced_accuracy": 0.7138608969215636,
+    "threshold_f1": 0.22,
+    "max_f1": 0.44145873320537427,
+    "threshold_sensitivity": 0.08,
+    "max_sensitivity": 0.917098445595855,
+    "threshold_specificity": 0.33,
+    "max_specificity": 0.9090113735783028
+  }
+}

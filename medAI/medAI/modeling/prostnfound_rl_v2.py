@@ -42,6 +42,8 @@ class ProstNFoundRLV2(nn.Module):
         boundary_tolerance_patches: int = 1,  # Patches to dilate prostate mask (on 16x16 feature grid)
         detach_attention_for_decoder: bool = False,  # If True, policy trained ONLY by RL
         attention_mode: Optional[str] = None,  # 'discrete', 'continuous', or 'bernoulli'
+        bernoulli_pool_stride: int = 1,  # >1 uses coarser Bernoulli grid (2 → 8×8=64 vars)
+        continuous_noise_scale: float = 0.0,  # Gaussian noise on logits during rollouts (continuous only)
     ):
         super().__init__()
         
@@ -86,6 +88,8 @@ class ProstNFoundRLV2(nn.Module):
             discrete_mode=self.discrete_attention,  # legacy bool for compat
             boundary_tolerance_patches=boundary_tolerance_patches,
             attention_mode=self.attention_mode,
+            bernoulli_pool_stride=bernoulli_pool_stride,
+            continuous_noise_scale=continuous_noise_scale,
         )
         
         # Value network (optional, for PPO)
@@ -109,10 +113,14 @@ class ProstNFoundRLV2(nn.Module):
         else:
             # For continuous and bernoulli: modulate dense embeddings with attention map
             # Input channels: policy_hidden_dim (from policy output), Output: 256 (SAM embedding size)
-            # Both modes produce (B, hidden_dim, H, W) weighted features
+            # Both modes produce (B, hidden_dim, H, W) weighted features.
+            # bias=False is critical for Bernoulli: unselected patches have zero features,
+            # and Conv(0)=0 must hold so they contribute nothing to the decoder.
+            # With bias, Tanh(bias) ≠ 0 even for masked-out patches, breaking the selection.
+            # GELU is consistent with SAM/ViT internal activations and does not saturate.
             self.attention_modulation = nn.Sequential(
-                nn.Conv2d(policy_hidden_dim, 256, kernel_size=1),
-                nn.Tanh(),
+                nn.Conv2d(policy_hidden_dim, 256, kernel_size=1, bias=False),
+                nn.GELU(),
             )
         
         logging.info(
@@ -431,6 +439,8 @@ def prostnfound_rl_v2_adapter_medsam(
     boundary_tolerance_patches: int = 1,
     detach_attention_for_decoder: bool = False,
     attention_mode: str = None,  # 'discrete', 'continuous', or 'bernoulli'
+    bernoulli_pool_stride: int = 1,
+    continuous_noise_scale: float = 0.0,
     prostnfound_kw: dict = {},
     **kwargs,
 ):
@@ -479,6 +489,8 @@ def prostnfound_rl_v2_adapter_medsam(
         boundary_tolerance_patches=boundary_tolerance_patches,
         detach_attention_for_decoder=detach_attention_for_decoder,
         attention_mode=attention_mode,
+        bernoulli_pool_stride=bernoulli_pool_stride,
+        continuous_noise_scale=continuous_noise_scale,
     )
     
     return model
@@ -500,6 +512,8 @@ def prostnfound_rl_v2_adapter_medsam_legacy(
     boundary_tolerance_patches: int = 1,
     detach_attention_for_decoder: bool = False,
     attention_mode: str = None,  # 'discrete', 'continuous', or 'bernoulli'
+    bernoulli_pool_stride: int = 1,
+    continuous_noise_scale: float = 0.0,
     **kwargs,
 ):
     """
@@ -524,6 +538,8 @@ def prostnfound_rl_v2_adapter_medsam_legacy(
         boundary_tolerance_patches=boundary_tolerance_patches,
         detach_attention_for_decoder=detach_attention_for_decoder,
         attention_mode=attention_mode,
+        bernoulli_pool_stride=bernoulli_pool_stride,
+        continuous_noise_scale=continuous_noise_scale,
         prostnfound_kw={'use_class_decoder': use_class_decoder},
         **kwargs,
     )

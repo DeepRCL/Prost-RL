@@ -1,0 +1,145 @@
+# =============================================================================
+# DRPO Two-Phase: Supervised Warmup → DRPO Fine-tuning (Bernoulli)
+# =============================================================================
+#
+# ROOT CAUSE: DRPO fails from scratch because of chicken-and-egg problem:
+#   - Policy needs stable reward signal → requires trained decoder
+#   - Decoder needs consistent attention → requires trained policy
+#   - DRPO's diverse rollouts break both simultaneously
+#
+# FIX: Two-phase training
+#   Phase 1 (epochs 0-9): Supervised warmup with NO RL, NO diversity
+#     → Decoder learns to predict cancer from attention features
+#     → Attention learns implicitly from supervised gradient
+#     → Both converge to a reasonable baseline
+#
+#   Phase 2 (epochs 10-34): DRPO with best-rollout training
+#     → Decoder is stable (near-frozen with rl_lr_factor=0.1)
+#     → DRPO rollouts now produce MEANINGFUL reward differences
+#       because the trained decoder actually responds differently
+#       to different attention patterns
+#     → Policy optimizes WHERE to attend while decoder stays stable
+#     → LR restarts for fresh cosine schedule in RL phase
+#
+# This is analogous to RLHF: supervised pre-training → RL fine-tuning
+# =============================================================================
+
+name: "V3-DRPO-twophase-bernoulli"
+
+data:
+  fold: 0
+  n_folds: 5
+  test_center: null
+  exclude_benign_cores_from_positive_patients: true
+  involvement_threshold_pct: null
+  undersample_benign_ratio: null
+  cohort_selection_mode: kfold
+  dataset: default
+  batch_size: 8
+  num_workers: 8
+  train_subsample_seed: 42
+  augmentations: translate
+  image_size: 256
+  first_downsample_size: null
+  mask_size: 64
+  limit_train_data: null
+  mean: [0, 0, 0]
+  std: [1, 1, 1]
+  flip_ud: false
+  frames: first
+  crop_to_prostate: false
+  rf_as_bmode: false
+  include_rf: false
+
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ attention_mode: bernoulli
+ use_value_function: false           # DRPO uses group-normalized advantages
+ upsample: false
+ boundary_tolerance_patches: 2
+ detach_attention_for_decoder: false
+ bernoulli_pool_stride: 1
+
+# Standard MIL loss (proven best)
+loss: symmetric_ce_entropy_reg
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+use_rl: true
+rl_mode: drpo
+rl_best_rollout_training: true       # Best-rollout supervised in RL phase
+
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+# === TWO-PHASE TRAINING ===
+rl_supervised_warmup_epochs: 10      # Phase 1: 10 epochs supervised only
+rl_lr_restart: true                  # Restart LR schedule when entering RL phase
+rl_lr_factor: 0.25                   # Reduce decoder LR by 4× in RL phase
+
+# Combined reward so DRPO has two meaningful components
+rl_reward_mode: combined_v2
+rl_heatmap_reward_weight: 0.5
+rl_classification_reward_weight: 0.5
+rl_cspca_bonus: 2
+
+rl_num_samples_per_image: 6          # 6 samples → more stable DRPO group normalization (4 was too noisy)
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.01
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+
+drpo_reward_weights: [2, 1]
+drpo_num_clusters: 2                 # 2 clusters = cancer vs benign (3 was too few per cluster with batch=8)
+drpo_epsilon: 1.0e-4
+drpo_strict_mode: true
+
+rl_benign_sparsity_penalty_weight: 0.0
+
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 8.0e-06
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.01
+epochs: 35                           # 10 supervised + 25 DRPO
+accumulate_grad_steps: 1
+cutoff_epoch: null
+scheduler: cosine
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+
+tracked_metric: val/core_auc_high_involvement
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

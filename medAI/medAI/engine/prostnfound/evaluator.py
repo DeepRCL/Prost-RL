@@ -377,6 +377,18 @@ class ProstNFoundMetricsCalculator:
                 }
             )
 
+            # Classification head AUC restricted to high-involvement cancer + benign
+            # (same subset used for core_auc_high_involvement)
+            hi_keep = np.logical_or(
+                results_table.involvement.values > 0.4,
+                results_table.label.values == 0,
+            )
+            if hi_keep.sum() > 0:
+                metrics["core_auc_image_level_high_inv"] = _auc_roc(
+                    image_level_predictions[hi_keep],
+                    results_table.label.values[hi_keep],
+                )
+
         if self.include_heatmap_cspca_metrics:
             heatmap_predictions = results_table["average_needle_heatmap_value"]
             image_level_labels = (results_table.grade_group.values > 2).astype(int)
@@ -388,6 +400,15 @@ class ProstNFoundMetricsCalculator:
                     f"{metric}_heatmap_cspca": value
                     for metric, value in metrics_.items()
                 }
+            )
+
+        # Combined high-involvement AUC: heatmap head + classification head,
+        # both restricted to involvement > 40% | benign.
+        # Range [0, 2] — maximised when both heads are perfect (AUC = 1 each).
+        if "core_auc_high_involvement" in metrics and "core_auc_image_level_high_inv" in metrics:
+            metrics["combined_high_inv_auc"] = (
+                metrics["core_auc_high_involvement"]
+                + metrics["core_auc_image_level_high_inv"]
             )
 
         # convert to float 

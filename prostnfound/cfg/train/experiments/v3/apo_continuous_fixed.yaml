@@ -1,0 +1,146 @@
+# =============================================================================
+# APO (Adaptive Policy Optimization) — Fixed Architecture
+# =============================================================================
+#
+# ROOT CAUSE ANALYSIS (see analysis below):
+#
+# The old PPO model worked because:
+#   1. Value function provided advantage baseline WITHOUT needing rollout diversity
+#   2. No diversity → same attention for all rollouts → consistent decoder signal
+#   3. Supervised loss ran once per batch (no multi-epoch amplification)
+#
+# GRPO/DRPO failed because:
+#   1. Group-normalized advantages REQUIRE diversity (variance across rollouts)
+#   2. Diversity (noise/Bernoulli) produces different decoder inputs per rollout,
+#      creating conflicting supervised gradients that destroy decoder training
+#   3. Supervised loss was applied 4x in multi-epoch PPO loop, drowning RL
+#   4. Continuous noise had broken action replay (now fixed in code)
+#
+# THIS CONFIG fixes all issues by:
+#   1. Using PPO+value function (advantage = R - V(s), not group-normalized)
+#      → meaningful advantages WITHOUT rollout diversity
+#   2. continuous_noise_scale: 0 (no diversity → consistent decoder conditioning)
+#   3. rl_num_update_epochs: 1 (avoids supervised gradient amplification)
+#   4. detach_attention_for_decoder: false (supervised gradient trains attention)
+#
+# The RL signal comes from PPO's value function baseline, NOT from comparing
+# different rollouts. This is the architecture that actually worked before.
+#
+# DRPO-style benefit: We use combined_v2 reward with cspca_bonus instead,
+# which naturally upweights clinically significant cancer through the reward
+# function rather than through group-normalized advantage scaling.
+# =============================================================================
+
+name: "V3-APO-continuous-fixed"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 8
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ attention_mode: continuous
+ use_value_function: true        # KEY: PPO value function for proper advantage baseline
+ upsample: false
+ boundary_tolerance_patches: 1
+ detach_attention_for_decoder: false  # Supervised gradient ALSO trains attention
+ continuous_noise_scale: 0       # KEY: NO noise → consistent decoder conditioning
+
+# Noise-robust loss for weak labels
+loss: symmetric_ce_entropy_reg
+loss_kw:
+  alpha: 1.0
+  beta: 1.0
+  epsilon: 1e-4
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+# RL configuration — PPO (not DRPO!)
+use_rl: true
+rl_mode: ppo
+
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+# Combined reward: classification + ROI involvement
+# The cspca_bonus naturally upweights csPCa cases (DRPO-like effect)
+rl_reward_mode: classification_only
+rl_cspca_bonus: 2
+
+# PPO hyperparameters — reduced RL updates to avoid supervised amplification
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 1          # KEY: Only 1 update epoch to avoid 4× supervised amplification
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.01
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+rl_value_coef: 0.5
+
+rl_benign_sparsity_penalty_weight: 0.0
+
+optimizer: adamw
+lr: 2.0e-05
+encoder_lr: 1.0e-05
+warmup_lr: 5.0e-05
+cnn_lr: 1.0e-05
+warmup_epochs: 1
+wd: 0.001
+epochs: 35
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+
+tracked_metric: val/core_auc_high_involvement
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: null
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

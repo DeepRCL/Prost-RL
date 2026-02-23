@@ -169,7 +169,7 @@ def main(cfg):
     )
     
     if cfg.model_checkpoint:
-        model_state = torch.load(cfg.model_checkpoint, map_location="cpu")
+        model_state = torch.load(cfg.model_checkpoint, map_location="cpu", weights_only=False)
         if "model" in model_state:
             model_state = model_state["model"]
         msg = model.load_state_dict(model_state, strict=False)
@@ -416,7 +416,13 @@ def main(cfg):
         save_checkpoint("experiment_state_rl.pth")
 
         if use_rl_this_epoch:
-            run_rl_train_epoch_batched(
+            if cfg.get('rl_best_rollout_training', False):
+                rl_train_fn = run_rl_train_epoch_best_rollout
+            elif cfg.get('rl_decoupled_training', False):
+                rl_train_fn = run_rl_train_epoch_decoupled
+            else:
+                rl_train_fn = run_rl_train_epoch_batched
+            rl_train_fn(
                 cfg,
                 model,
                 train_loader,
@@ -932,6 +938,449 @@ def run_rl_train_epoch_batched(
                 step_metrics[f"train_rl/{key}"] = value
         
         # Log learning rates
+        if hasattr(model, 'get_params_groups'):
+            step_metrics["encoder_lr"] = optimizer.param_groups[0]["lr"]
+            step_metrics["main_lr"] = optimizer.param_groups[1]["lr"]
+            step_metrics["cnn_lr"] = optimizer.param_groups[2]["lr"]
+
+        wandb.log(step_metrics)
+
+    metrics = evaluator.aggregate_metrics()
+    metrics = {f"{desc}/{k}": v for k, v in metrics.items()}
+    metrics["epoch"] = epoch
+    wandb.log(metrics)
+
+
+def run_rl_train_epoch_best_rollout(
+    args, model, loader, criterion, optimizer, scheduler, scaler, grpo, reward_computer, epoch, desc="Train RL (Best-Rollout)"
+):
+    """
+    Best-rollout RL training: supervised loss uses ONLY the best rollout per image.
+    
+    KEY INSIGHT: The decoupled approach failed because the decoder and RL policy
+    never saw each other's outputs, causing them to diverge. The coupled approach
+    failed because diverse rollouts created conflicting supervised gradients.
+    
+    This approach solves BOTH problems:
+    1. Run diverse rollouts (B * num_samples) → RL gets variance for advantages
+    2. Select the BEST rollout per image (highest reward)
+    3. Supervised loss ONLY on the B best rollouts → decoder trains on
+       the attention pattern that RL considers most promising
+    4. RL loss on ALL rollouts → proper DRPO/GRPO advantage computation
+    
+    This ALIGNS the RL and supervised objectives: the decoder learns to work
+    with exactly the attention patterns that the RL rewards most highly.
+    Over time, RL learns which attention produces good rewards, and the decoder
+    learns to use that specific attention well.
+    """
+    model.train()
+    evaluator = Evaluator(**args.evaluator)
+    
+    num_samples_per_image = args.get('rl_num_samples_per_image', 4)
+    num_rl_updates = args.get('rl_num_update_epochs', 4)
+    rl_mode = args.get('rl_mode', 'grpo').lower()
+    use_gdpo = rl_mode == 'gdpo'
+    use_drpo = rl_mode == 'drpo'
+    rl_weight = args.get('rl_loss_weight', 1.0)
+
+    for train_iter, data in enumerate(tqdm(loader, desc=desc)):
+
+        if args.debug and train_iter > 10:
+            break
+
+        B = data['bmode'].shape[0]
+        
+        # Generate domain IDs for DRPO
+        if use_drpo:
+            grade_data = data.get('grade', None)
+            if grade_data is None:
+                raise ValueError("[DRPO ERROR] 'grade' field not found in data!")
+            domain_list = []
+            for g in grade_data:
+                if g == "Benign" or g == 0:
+                    domain_list.append(0)
+                elif g in ["GG1", "GG2", "GG3", "GG4", "GG5"]:
+                    domain_list.append(1)
+                elif g in ["GS6", "GS7", "GS8", "GS9", "GS10"]:
+                    domain_list.append(1)
+                elif isinstance(g, int) and g > 0:
+                    domain_list.append(1)
+                else:
+                    raise ValueError(f"[DRPO ERROR] Unknown grade value: '{g}'")
+            domain_ids = torch.tensor(domain_list, dtype=torch.long).to(args.device)
+        else:
+            domain_ids = None
+        
+        # ====================================================================
+        # Step 1: Collect diverse rollouts (no grad)
+        # ====================================================================
+        with torch.no_grad():
+            batched_data = replicate_batch_for_sampling(data, num_samples_per_image, args.device)
+            batched_outputs = model(batched_data, deterministic=False)
+            
+            old_log_probs = batched_outputs.get('rl_log_probs').detach()
+            rollout_action_indices = batched_outputs.get('rl_action_indices')
+            
+            # Compute rewards
+            if use_gdpo or use_drpo:
+                all_rewards, reward_components = reward_computer.compute_reward_components(
+                    batched_outputs, batched_data, num_samples_per_image=num_samples_per_image
+                )
+            else:
+                all_rewards = reward_computer(batched_outputs, batched_data, num_samples_per_image=num_samples_per_image)
+                reward_components = None
+            
+            # ================================================================
+            # Step 1b: Find the BEST rollout per image (highest reward)
+            # ================================================================
+            rewards_per_image = all_rewards.view(B, num_samples_per_image)  # B x K
+            best_indices = rewards_per_image.argmax(dim=1)  # B — index of best rollout per image
+            
+            # Absolute indices in the flattened batch
+            best_abs_indices = best_indices + torch.arange(B, device=best_indices.device) * num_samples_per_image
+        
+        # ====================================================================
+        # Step 2: PPO update epochs
+        # ====================================================================
+        optimizer.zero_grad()
+        rl_metrics_list = []
+        supervised_loss_avg = 0.0
+        total_loss_avg = 0.0
+        
+        for rl_epoch in range(num_rl_updates):
+            with torch.amp.autocast('cuda', enabled=args.use_amp):
+                # Forward ALL rollouts (for RL loss on all + supervised on best)
+                current_outputs = model(
+                    batched_data,
+                    deterministic=False,
+                    rl_action_indices=rollout_action_indices,
+                )
+                current_log_probs = current_outputs.get('rl_log_probs')
+                current_values = current_outputs.get('rl_value')
+                
+                # ============================================================
+                # Supervised loss: ONLY on the BEST rollout per image
+                # ============================================================
+                # Extract just the best rollout's data for supervised loss.
+                # Need to handle: plain tensors, lists, tuples of tensors
+                best_data = {}
+                for key, value in current_outputs.items():
+                    if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == B * num_samples_per_image:
+                        best_data[key] = value[best_abs_indices]
+                    elif isinstance(value, (list, tuple)) and len(value) == B * num_samples_per_image:
+                        # List/tuple of per-sample items
+                        selected = [value[i] for i in best_abs_indices.tolist()]
+                        best_data[key] = type(value)(selected)  # preserve list vs tuple
+                    elif isinstance(value, (list, tuple)):
+                        # Tuple/list of tensors (e.g., image_level_classification_outputs = (logits_tensor,))
+                        filtered = []
+                        for v in value:
+                            if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] == B * num_samples_per_image:
+                                filtered.append(v[best_abs_indices])
+                            else:
+                                filtered.append(v)
+                        best_data[key] = type(value)(filtered)
+                    else:
+                        best_data[key] = value
+                
+                supervised_loss = criterion(best_data)
+                
+                # RL loss on ALL rollouts (proper DRPO/GRPO)
+                if use_drpo:
+                    rl_loss, rl_info = grpo.compute_loss(
+                        current_log_probs, old_log_probs, all_rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
+                        values=current_values,
+                        reward_components=[rc.detach() for rc in reward_components],
+                        domain_ids=domain_ids,
+                    )
+                elif use_gdpo:
+                    rl_loss, rl_info = grpo.compute_loss(
+                        current_log_probs, old_log_probs, all_rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
+                        values=current_values,
+                        reward_components=[rc.detach() for rc in reward_components],
+                    )
+                else:
+                    rl_loss, rl_info = grpo.compute_loss(
+                        current_log_probs, old_log_probs, all_rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
+                        values=current_values,
+                    )
+                
+                total_loss = supervised_loss + rl_weight * rl_loss
+                rl_metrics_list.append(rl_info)
+                supervised_loss_avg += supervised_loss.item()
+                total_loss_avg += total_loss.item()
+            
+            # Backprop
+            scaled_loss = total_loss / (args.accumulate_grad_steps * num_rl_updates)
+            if args.use_amp:
+                scaler.scale(scaled_loss).backward()
+            else:
+                scaled_loss.backward()
+        
+        # ====================================================================
+        # Step 3: Optimizer step
+        # ====================================================================
+        if (train_iter + 1) % args.accumulate_grad_steps == 0:
+            if args.use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.get('rl_max_grad_norm', 0.5)
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.get('rl_max_grad_norm', 0.5)
+                )
+                optimizer.step()
+                optimizer.zero_grad()
+            scheduler.step()
+        
+        supervised_loss_avg /= num_rl_updates
+        total_loss_avg /= num_rl_updates
+
+        # ====================================================================
+        # Step 4: Logging
+        # ====================================================================
+        with torch.no_grad():
+            eval_data = model(data, deterministic=True)
+        
+        step_metrics = {f"train/{k}": v for k, v in evaluator(eval_data).items()}
+        step_metrics.update({
+            "train_loss": supervised_loss_avg,
+            "train_total_loss": total_loss_avg,
+        })
+        
+        if rl_metrics_list:
+            avg_rl_metrics = {}
+            for key in rl_metrics_list[0].keys():
+                avg_rl_metrics[f"train_rl/{key}"] = np.mean([m[key] for m in rl_metrics_list])
+            step_metrics.update(avg_rl_metrics)
+        
+        step_metrics.update({
+            "train_rl/reward_mean": all_rewards.mean().item(),
+            "train_rl/reward_std": all_rewards.std().item(),
+            "train_rl/within_image_reward_std": rewards_per_image.std(dim=1).mean().item(),
+            "train_rl/best_rollout_reward_mean": all_rewards[best_abs_indices].mean().item(),
+        })
+        
+        if hasattr(model, 'get_params_groups'):
+            step_metrics["encoder_lr"] = optimizer.param_groups[0]["lr"]
+            step_metrics["main_lr"] = optimizer.param_groups[1]["lr"]
+            step_metrics["cnn_lr"] = optimizer.param_groups[2]["lr"]
+
+        wandb.log(step_metrics)
+
+    metrics = evaluator.aggregate_metrics()
+    metrics = {f"{desc}/{k}": v for k, v in metrics.items()}
+    metrics["epoch"] = epoch
+    wandb.log(metrics)
+
+
+def run_rl_train_epoch_decoupled(
+    args, model, loader, criterion, optimizer, scheduler, scaler, grpo, reward_computer, epoch, desc="Train RL (Decoupled)"
+):
+    """
+    Decoupled RL training: supervised and RL losses use SEPARATE forward passes.
+    
+    Key insight: The old (working) training loop computed supervised loss on ALL
+    rollouts (B*4 samples with different attention due to noise/Bernoulli), which
+    created conflicting decoder gradients and 4x gradient amplification. This new
+    loop fixes both issues:
+    
+    1. SUPERVISED STEP: Single deterministic forward pass on B samples.
+       The decoder sees consistent attention → stable supervised training.
+       
+    2. RL STEP: Diverse rollouts (B * num_samples) for DRPO/GRPO advantages.
+       Only the RL (policy gradient) loss is computed, NOT the supervised loss.
+       This ensures diverse rollouts provide DRPO advantage signal without
+       corrupting the decoder.
+       
+    3. Combined gradient: supervised_grad + rl_weight * rl_grad, optimizer steps once.
+    
+    Supports: GRPO, GDPO, DRPO, PPO (all modes).
+    """
+    model.train()
+    evaluator = Evaluator(**args.evaluator)
+    
+    num_samples_per_image = args.get('rl_num_samples_per_image', 4)
+    num_rl_updates = args.get('rl_num_update_epochs', 4)
+    rl_mode = args.get('rl_mode', 'grpo').lower()
+    use_gdpo = rl_mode == 'gdpo'
+    use_drpo = rl_mode == 'drpo'
+    rl_weight = args.get('rl_loss_weight', 1.0)
+
+    for train_iter, data in enumerate(tqdm(loader, desc=desc)):
+
+        if args.debug and train_iter > 10:
+            break
+
+        B = data['bmode'].shape[0]
+        
+        # Generate domain IDs for DRPO
+        if use_drpo:
+            grade_data = data.get('grade', None)
+            if grade_data is None:
+                raise ValueError("[DRPO ERROR] 'grade' field not found in data!")
+            domain_list = []
+            for g in grade_data:
+                if g == "Benign" or g == 0:
+                    domain_list.append(0)
+                elif g in ["GG1", "GG2", "GG3", "GG4", "GG5"]:
+                    domain_list.append(1)
+                elif g in ["GS6", "GS7", "GS8", "GS9", "GS10"]:
+                    domain_list.append(1)
+                elif isinstance(g, int) and g > 0:
+                    domain_list.append(1)
+                else:
+                    raise ValueError(f"[DRPO ERROR] Unknown grade value: '{g}'")
+            domain_ids = torch.tensor(domain_list, dtype=torch.long).to(args.device)
+        else:
+            domain_ids = None
+        
+        optimizer.zero_grad()
+        
+        # ====================================================================
+        # PHASE 1: SUPERVISED LOSS — deterministic forward on original B samples
+        # ====================================================================
+        # The decoder sees ONE consistent attention map per image.
+        # No noise, no Bernoulli sampling → stable decoder training.
+        with torch.amp.autocast('cuda', enabled=args.use_amp):
+            supervised_data = model(data, deterministic=True)
+            supervised_loss = criterion(supervised_data)
+        
+        # Backprop supervised loss
+        scaled_supervised_loss = supervised_loss / args.accumulate_grad_steps
+        if args.use_amp:
+            scaler.scale(scaled_supervised_loss).backward()
+        else:
+            scaled_supervised_loss.backward()
+        
+        # ====================================================================
+        # PHASE 2: RL LOSS — diverse rollouts for DRPO/GRPO advantage signal
+        # ====================================================================
+        # Step 2a: Collect rollouts (no grad)
+        with torch.no_grad():
+            batched_data = replicate_batch_for_sampling(data, num_samples_per_image, args.device)
+            batched_outputs = model(batched_data, deterministic=False)
+            
+            old_log_probs = batched_outputs.get('rl_log_probs').detach()
+            rollout_action_indices = batched_outputs.get('rl_action_indices')
+            
+            # Compute rewards
+            if use_gdpo or use_drpo:
+                all_rewards, reward_components = reward_computer.compute_reward_components(
+                    batched_outputs, batched_data, num_samples_per_image=num_samples_per_image
+                )
+            else:
+                all_rewards = reward_computer(batched_outputs, batched_data, num_samples_per_image=num_samples_per_image)
+                reward_components = None
+        
+        # Step 2b: PPO-style update epochs (RL loss ONLY, no supervised loss)
+        rl_metrics_list = []
+        for rl_epoch in range(num_rl_updates):
+            with torch.amp.autocast('cuda', enabled=args.use_amp):
+                current_outputs = model(
+                    batched_data,
+                    deterministic=False,
+                    rl_action_indices=rollout_action_indices,
+                )
+                current_log_probs = current_outputs.get('rl_log_probs')
+                current_values = current_outputs.get('rl_value')
+                
+                # RL loss ONLY (no supervised loss on diverse rollouts!)
+                if use_drpo:
+                    rl_loss, rl_info = grpo.compute_loss(
+                        current_log_probs, old_log_probs, all_rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
+                        values=current_values,
+                        reward_components=[rc.detach() for rc in reward_components],
+                        domain_ids=domain_ids,
+                    )
+                elif use_gdpo:
+                    rl_loss, rl_info = grpo.compute_loss(
+                        current_log_probs, old_log_probs, all_rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
+                        values=current_values,
+                        reward_components=[rc.detach() for rc in reward_components],
+                    )
+                else:
+                    rl_loss, rl_info = grpo.compute_loss(
+                        current_log_probs, old_log_probs, all_rewards.detach(),
+                        num_samples_per_image=num_samples_per_image,
+                        values=current_values,
+                    )
+                
+                rl_metrics_list.append(rl_info)
+            
+            # Backprop RL loss (accumulates with supervised gradient)
+            scaled_rl_loss = (rl_weight * rl_loss) / (args.accumulate_grad_steps * num_rl_updates)
+            if args.use_amp:
+                scaler.scale(scaled_rl_loss).backward()
+            else:
+                scaled_rl_loss.backward()
+        
+        # ====================================================================
+        # PHASE 3: OPTIMIZER STEP
+        # ====================================================================
+        if (train_iter + 1) % args.accumulate_grad_steps == 0:
+            if args.use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.get('rl_max_grad_norm', 0.5)
+                )
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+            else:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    args.get('rl_max_grad_norm', 0.5)
+                )
+                optimizer.step()
+                optimizer.zero_grad()
+            scheduler.step()
+
+        # ====================================================================
+        # PHASE 4: LOGGING (deterministic forward for clean eval metrics)
+        # ====================================================================
+        with torch.no_grad():
+            eval_data = model(data, deterministic=True)
+        
+        step_metrics = {f"train/{k}": v for k, v in evaluator(eval_data).items()}
+        step_metrics.update({
+            "train_loss": supervised_loss.item(),
+            "train_rl_loss": rl_loss.item(),
+            "train_total_loss": supervised_loss.item() + rl_weight * rl_loss.item(),
+        })
+        
+        # Add RL metrics
+        if rl_metrics_list:
+            avg_rl_metrics = {}
+            for key in rl_metrics_list[0].keys():
+                avg_rl_metrics[f"train_rl/{key}"] = np.mean([m[key] for m in rl_metrics_list])
+            step_metrics.update(avg_rl_metrics)
+        
+        # Reward stats
+        step_metrics.update({
+            "train_rl/reward_mean": all_rewards.mean().item(),
+            "train_rl/reward_std": all_rewards.std().item(),
+            "train_rl/reward_min": all_rewards.min().item(),
+            "train_rl/reward_max": all_rewards.max().item(),
+            "train_rl/num_samples_per_image": num_samples_per_image,
+        })
+        
+        # Within-image reward variance (critical for DRPO: should be > 0)
+        rewards_per_image = all_rewards.view(B, num_samples_per_image)
+        within_image_std = rewards_per_image.std(dim=1).mean().item()
+        step_metrics["train_rl/within_image_reward_std"] = within_image_std
+        
+        # Learning rates
         if hasattr(model, 'get_params_groups'):
             step_metrics["encoder_lr"] = optimizer.param_groups[0]["lr"]
             step_metrics["main_lr"] = optimizer.param_groups[1]["lr"]

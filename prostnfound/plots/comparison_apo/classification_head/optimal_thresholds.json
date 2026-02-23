@@ -1,0 +1,42 @@
+{
+  "V3-APO-continuous-fixed": {
+    "threshold_balanced_accuracy": 0.11,
+    "max_balanced_accuracy": 0.7336093998612867,
+    "threshold_f1": 0.34,
+    "max_f1": 0.465,
+    "threshold_sensitivity": 0.03,
+    "max_sensitivity": 0.9326424870466321,
+    "threshold_specificity": 0.34,
+    "max_specificity": 0.9002624671916011
+  },
+  "V4-PPO-best-mil_prop_bce_entropy_reg-8samples\n": {
+    "threshold_balanced_accuracy": 0.27,
+    "max_balanced_accuracy": 0.6643275808140563,
+    "threshold_f1": 0.37,
+    "max_f1": 0.367601246105919,
+    "threshold_sensitivity": 0.17,
+    "max_sensitivity": 0.9119170984455959,
+    "threshold_specificity": 0.55,
+    "max_specificity": 0.9168853893263342
+  },
+  "V3-PPO-thresholded_involvement_entropy_reg": {
+    "threshold_balanced_accuracy": 0.08,
+    "max_balanced_accuracy": 0.7277911504585243,
+    "threshold_f1": 0.13,
+    "max_f1": 0.4572564612326044,
+    "threshold_sensitivity": 0.03,
+    "max_sensitivity": 0.9015544041450777,
+    "threshold_specificity": 0.22,
+    "max_specificity": 0.9011373578302713
+  },
+  "ProstNFound": {
+    "threshold_balanced_accuracy": 0.05,
+    "max_balanced_accuracy": 0.7073037502436548,
+    "threshold_f1": 0.08,
+    "max_f1": 0.42080378250591016,
+    "threshold_sensitivity": 0.02,
+    "max_sensitivity": 0.9585492227979274,
+    "threshold_specificity": 0.09999999999999999,
+    "max_specificity": 0.9125109361329834
+  }
+}

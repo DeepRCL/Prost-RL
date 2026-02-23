@@ -1,0 +1,137 @@
+# =============================================================================
+# ABLATION: Coarse-Grid Bernoulli DRPO — Fine-Tuned from Supervised (FST init)
+# =============================================================================
+#
+# Purpose:
+#   Isolate the effect of initialisation: does starting from a supervised
+#   checkpoint (V3-supervised-only-high-inv / FST) rather than raw MedSAM
+#   pretrained weights improve RL convergence and heatmap quality?
+#
+#   Everything else is identical to V3-DRPO-bernoulli-coarse-grid:
+#     • Bernoulli attention, 8×8 coarse grid (bernoulli_pool_stride: 2)
+#     • classification_only reward
+#     • DRPO with the same hyperparameters
+#
+# Hypothesis:
+#   The supervised checkpoint has already learned:
+#     1. Which image regions are diagnostically relevant (decoder)
+#     2. A structured policy that responds to prostate anatomy
+#   Starting from this rather than MedSAM should give the RL stage a much
+#   better prior, leading to faster convergence and less "shadow/artifact"
+#   attention during the RL exploration phase.
+#
+# Comparison target: V3-DRPO-bernoulli-coarse-grid  (same, from MedSAM init)
+# =============================================================================
+
+name: "V3-DRPO-bernoulli-coarse-FST-detached"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 8
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ attention_mode: bernoulli
+ use_value_function: false
+ upsample: false
+ boundary_tolerance_patches: 1
+ detach_attention_for_decoder: true
+ bernoulli_pool_stride: 2   # 16×16 → 8×8 = 64 Bernoulli variables
+
+loss: thresholded_involvement_entropy_reg
+loss_kw:
+  threshold: 0.5
+  soft_temperature: 0.1
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+use_rl: true
+rl_mode: drpo
+
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+rl_reward_mode: classification_only
+rl_cspca_bonus: 2
+
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.0
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+
+drpo_reward_weights: [1.0, 1.0]
+drpo_num_clusters: 3
+drpo_epsilon: 1.0e-4
+drpo_strict_mode: true
+
+rl_benign_sparsity_penalty_weight: 0.0
+
+optimizer: adamw
+lr: 1.0e-05        # lower LR — warm start from supervised, avoid catastrophic forgetting
+encoder_lr: 5.0e-06
+warmup_lr: 2.0e-05
+cnn_lr: 5.0e-06
+warmup_epochs: 1
+wd: 0.001
+epochs: 20
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+
+tracked_metric: val/combined_high_inv_auc
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+# FST: fine-tune from supervised checkpoint instead of raw MedSAM pretrained
+model_checkpoint: checkpoints_rl_v3/V3-supervised-only-high-inv/best_rl.pth
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

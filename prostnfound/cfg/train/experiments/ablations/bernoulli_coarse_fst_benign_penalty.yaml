@@ -1,0 +1,151 @@
+# =============================================================================
+# ABLATION: Coarse-Grid Bernoulli DRPO — FST init + Combined Reward + Benign Penalty
+# =============================================================================
+#
+# Directly targets the observed failure mode of V3-DRPO-bernoulli-8x8:
+#   "The model puts attention on shadow/black regions which have no diagnostic info."
+#
+# Three-pronged attack on shadow attention:
+#
+#   1. FST initialisation:
+#      Start from the supervised model that has already learned to focus on
+#      anatomically relevant regions — shadow attention is less likely from the start.
+#
+#   2. combined_v2 reward:
+#      ROI involvement reward gives zero benefit for attending to shadows because
+#      shadow regions are outside the needle ROI, so the policy gets no reward
+#      credit for modulating them.
+#
+#   3. Benign sparsity penalty (rl_benign_sparsity_penalty_weight: 0.3):
+#      Adds an explicit penalty = weight × mean_attention_in_benign_case.
+#      For benign cores, the optimal policy should produce SPARSE attention
+#      (nothing to find → don't attend anywhere).  This directly pushes the
+#      policy away from high-confidence shadow attention in negative cases,
+#      which is the root cause of the artifact pattern.
+#
+# Weight 0.3 is a conservative starting point:
+#   • Too high → suppresses all benign attention → collapse risk
+#   • Too low → no effect
+#   The combined_v2 ROI reward provides enough positive signal so the policy
+#   still has reason to attend in cancer cases.
+#
+# Expected outcome:
+#   • Attention entropy in benign cases decreases (sparser maps)
+#   • Shadow/artifact attention_auroc drops below baseline
+#   • Qualitative heatmaps show attention concentrated on cancer ROI
+# =============================================================================
+
+name: "V3-DRPO-bernoulli-coarse-FST-benign-penalty"
+
+data:
+ fold: 0
+ n_folds: 5
+ test_center: null
+ exclude_benign_cores_from_positive_patients: true
+ involvement_threshold_pct: null
+ undersample_benign_ratio: null
+ cohort_selection_mode: kfold
+ dataset: default
+ batch_size: 8
+ num_workers: 8
+ train_subsample_seed: 42
+ augmentations: translate
+ image_size: 256
+ first_downsample_size: null
+ mask_size: 64
+ limit_train_data: null
+ mean: [0, 0, 0]
+ std: [1, 1, 1]
+ flip_ud: false
+ frames: first
+ crop_to_prostate: false
+ rf_as_bmode: false
+ include_rf: false
+
+model: prostnfound_rl_v2_adapter_medsam_legacy
+model_kw:
+ prompts: [age, psa, psad, pos]
+ use_clinical_in_policy: true
+ use_class_decoder: true
+ num_attention_patches: 4
+ policy_hidden_dim: 256
+ freeze_prostnfound: false
+ use_prostate_mask_constraint: true
+ attention_mode: bernoulli
+ use_value_function: false
+ upsample: false
+ boundary_tolerance_patches: 1
+ detach_attention_for_decoder: false
+ bernoulli_pool_stride: 2   # 16×16 → 8×8 = 64 Bernoulli variables
+
+loss: thresholded_involvement_entropy_reg
+loss_kw:
+  threshold: 0.5
+  soft_temperature: 0.1
+
+add_image_clf: true
+image_clf_mode: cspca
+image_clf_class_weight: balanced
+
+use_rl: true
+rl_mode: drpo
+
+decoder_prostate_mask_constraint: true
+outside_prostate_penalty: false
+
+rl_reward_mode: combined_v2
+rl_heatmap_reward_weight: 0.5
+rl_classification_reward_weight: 0.5
+rl_cspca_bonus: 2
+
+# Penalise high attention in benign cases — targets the shadow/artifact problem
+rl_benign_sparsity_penalty_weight: 0.3
+
+rl_num_samples_per_image: 4
+rl_num_update_epochs: 4
+rl_clip_eps: 0.2
+rl_entropy_coef: 0.0
+rl_kl_coef: 0.0
+rl_max_grad_norm: 0.5
+rl_loss_weight: 1.0
+
+drpo_reward_weights: [1.0, 1.0]
+drpo_num_clusters: 3
+drpo_epsilon: 1.0e-4
+drpo_strict_mode: true
+
+optimizer: adamw
+lr: 1.0e-05
+encoder_lr: 5.0e-06
+warmup_lr: 2.0e-05
+cnn_lr: 5.0e-06
+warmup_epochs: 1
+wd: 0.001
+epochs: 20
+accumulate_grad_steps: 1
+cutoff_epoch: null
+
+run_test: false
+test_every_epoch: false
+run_val: true
+
+project: prostnfound_noise_robust
+seed: 30
+
+tracked_metric: val/combined_high_inv_auc
+
+wandb:
+ mode: online
+
+save_checkpoint_wandb: false
+torch_compile: false
+use_amp: true
+device: cuda
+checkpoint_dir: checkpoints_rl_v3/${name}
+model_checkpoint: checkpoints_rl_v3/V3-supervised-only-high-inv/best_rl.pth
+debug: false
+save_best_weights: true
+
+evaluator:
+ log_images: false
+ log_images_every: 100

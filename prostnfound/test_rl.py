@@ -451,9 +451,11 @@ def main(args):
                     attn_map_resized = skimage.transform.resize(
                         attn_map, (img_h, img_w), order=1, preserve_range=True
                     )
-                    # Normalize to [0, 1]
-                    attn_map_resized = (attn_map_resized - attn_map_resized.min()) / (attn_map_resized.max() - attn_map_resized.min() + 1e-8)
-                    
+                    # Display on absolute [0, 1] scale — do NOT min-max normalize.
+                    # Min-max norm is misleading: when probs are uniform inside the
+                    # prostate (~0.48) and zero outside, normalization maps everything
+                    # inside to 1.0 (max red), making any model look like a filled mask.
+                    # With vmin=0/vmax=1 the colormap correctly shows ~0.5 as mid-red.
                     if original_aspect_ratio is not None:
                         im = ax[1].imshow(attn_map_resized, cmap='Reds', vmin=0, vmax=1, aspect=1.0/display_aspect_ratio)
                     else:

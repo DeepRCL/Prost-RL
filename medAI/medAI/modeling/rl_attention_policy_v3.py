@@ -46,6 +46,10 @@ class PatchAttentionPolicy(nn.Module):
         discrete_mode: bool = True,
         boundary_tolerance_patches: int = 1,  # Patches to dilate prostate mask (on 16x16 feature grid)
         attention_mode: Optional[str] = None,  # 'discrete', 'continuous', or 'bernoulli'
+        bernoulli_pool_stride: int = 1,  # >1 uses coarser spatial grid for Bernoulli (reduces action space)
+        continuous_noise_scale: float = 0.0,  # >0 adds Gaussian noise to logits during training rollouts
+                                               # gives genuine GRPO diversity for continuous mode
+                                               # default 0.0 = backward-compatible (old behaviour)
     ):
         super().__init__()
         
@@ -56,6 +60,10 @@ class PatchAttentionPolicy(nn.Module):
         self.use_clinical_features = use_clinical_features
         self.use_prostate_mask_constraint = use_prostate_mask_constraint
         self.boundary_tolerance_patches = boundary_tolerance_patches
+        # bernoulli_pool_stride=2 → 8×8=64 variables instead of 16×16=256
+        # reduces gradient dilution and makes spatial credit assignment easier
+        self.bernoulli_pool_stride = bernoulli_pool_stride
+        self.continuous_noise_scale = continuous_noise_scale
 
         # Resolve attention_mode (new API) vs discrete_mode (deprecated bool API)
         if attention_mode is not None:
@@ -175,16 +183,42 @@ class PatchAttentionPolicy(nn.Module):
             )
         elif self.attention_mode == 'bernoulli':
             # Bernoulli mode: independent binary mask per patch
-            return self._bernoulli_forward(
-                features, attention_logits, attention_map, B, H, W,
-                deterministic, action_indices, return_action_indices,
-                prostate_mask_dilated
-            )
+            # Optionally pool to coarser grid to reduce action-space and
+            # increase per-variable gradient strength (bernoulli_pool_stride > 1)
+            if self.bernoulli_pool_stride > 1:
+                s = self.bernoulli_pool_stride
+                coarse_logits = F.avg_pool2d(
+                    attention_logits.view(B, 1, H, W),
+                    kernel_size=s, stride=s
+                ).view(B, -1)          # B x (H/s * W/s)
+                coarse_mask_dilated = (
+                    F.max_pool2d(
+                        prostate_mask_dilated if prostate_mask_dilated is not None
+                        else torch.ones(B, 1, H, W, device=features.device),
+                        kernel_size=s, stride=s
+                    ) if prostate_mask_dilated is not None else None
+                )
+                Hc, Wc = H // s, W // s
+                return self._bernoulli_forward(
+                    features, coarse_logits, attention_map, B, H, W,
+                    deterministic, action_indices, return_action_indices,
+                    prostate_mask_dilated,
+                    coarse_H=Hc, coarse_W=Wc,
+                    coarse_mask_dilated=coarse_mask_dilated,
+                )
+            else:
+                return self._bernoulli_forward(
+                    features, attention_logits, attention_map, B, H, W,
+                    deterministic, action_indices, return_action_indices,
+                    prostate_mask_dilated
+                )
         else:
-            # Continuous mode: softmax-weighted sum (fully deterministic)
+            # Continuous mode: softmax-weighted sum
             return self._continuous_forward(
                 features, attention_logits, attention_map, B, H, W,
-                prostate_mask_dilated
+                prostate_mask_dilated, deterministic=deterministic,
+                action_indices=action_indices,
+                return_action_indices=return_action_indices,
             )
     
     def _discrete_forward(
@@ -232,44 +266,84 @@ class PatchAttentionPolicy(nn.Module):
         attention_map: torch.Tensor,
         B: int, H: int, W: int,
         prostate_mask_dilated: torch.Tensor = None,
+        deterministic: bool = False,
+        action_indices: torch.Tensor = None,
+        return_action_indices: bool = False,
     ):
-        """Continuous attention mode."""
-        
-        # Compute attention weights
-        attention_probs = F.softmax(attention_logits, dim=1).view(B, 1, H, W)
-        
-        # Weighted features (B, C, H, W)
+        """Continuous attention mode.
+
+        When self.continuous_noise_scale > 0 and not deterministic, Gaussian noise
+        is added to the logits before softmax, creating genuine rollout diversity so
+        GRPO advantages are non-trivial.
+
+        Action replay for PPO/GRPO update epochs:
+          During rollout: fresh noise is sampled and saved as action_indices.
+          During replay: the saved noise is re-used, and log_prob is recomputed
+          under the CURRENT policy parameters, enabling proper policy gradient.
+
+        log_prob uses the categorical cross-entropy between the clean softmax
+        distribution p(·|θ) and the noisy softmax distribution q(·|θ,ε):
+          log_prob = Σ_i q_i * log(p_i)
+        This quantity depends on θ (through p_i = softmax(logits_i)) so the
+        GRPO ratio exp(log_p_new - log_p_old) is a valid importance weight.
+
+        noise_scale=0 (old/default): -entropy(softmax) — kept for backward compat.
+        """
+        sigma = self.continuous_noise_scale
+        use_noise = (sigma > 0.0) and (not deterministic) and self.training
+
+        if use_noise:
+            if action_indices is not None:
+                # PPO update epoch: replay the saved noise
+                noise = action_indices
+            else:
+                # Rollout: sample fresh noise
+                noise = torch.randn_like(attention_logits) * sigma
+
+            noisy_logits = attention_logits + noise
+            attention_probs = F.softmax(noisy_logits, dim=1).view(B, 1, H, W)
+
+            # log_prob that depends on policy parameters θ:
+            # Use the categorical log-prob: Σ_i q_i * log(p_i)
+            # where p_i = softmax(logits_i) is the clean policy distribution
+            #       q_i = softmax(logits_i + noise_i) is the noisy (sampled) distribution
+            # This is equivalent to -cross_entropy(q, p) and varies with θ.
+            clean_log_probs = F.log_softmax(attention_logits, dim=1)  # log p_i(θ)
+            noisy_probs = attention_probs.view(B, -1)  # q_i — detached from graph via softmax(logits+noise)
+            # Σ_i q_i * log(p_i):  measures how well the clean policy explains the noisy action
+            policy_log_prob = (noisy_probs.detach() * clean_log_probs).sum(dim=1)  # B
+
+            action_indices_out = noise if return_action_indices else None
+        else:
+            attention_probs = F.softmax(attention_logits, dim=1).view(B, 1, H, W)
+            # Legacy surrogate: -entropy used as log_prob.
+            # Backward-compatible with all models trained with continuous_noise_scale=0.
+            log_probs_cat = F.log_softmax(attention_logits, dim=1)
+            entropy = -(attention_probs.view(B, -1) * log_probs_cat).sum(dim=1)
+            policy_log_prob = -entropy
+            action_indices_out = None
+
         weighted_features = features * attention_probs
-        
-        # Log probs for policy gradient (entropy over distribution)
-        log_probs = F.log_softmax(attention_logits, dim=1)  # B x (H*W)
-        entropy = -(attention_probs.view(B, -1) * log_probs).sum(dim=1)  # B
-        policy_log_prob = -entropy  # Use negative entropy as "log prob" for REINFORCE
-        
-        # For visualization: return the masked attention map (attention_probs) 
-        # instead of raw attention_map, so we don't show misleading values outside prostate
-        # The attention_probs already has zeros outside prostate due to softmax(-inf) = 0
-        # We use sigmoid for visualization since it's bounded [0, 1]
-        masked_attention_map = attention_probs  # This is already masked via softmax
-        
-        # Alternatively, create a visualization-friendly map by applying mask to sigmoid of raw logits
-        viz_attention_map = torch.sigmoid(attention_map)  # B x 1 x H x W
+
+        viz_attention_map = torch.sigmoid(attention_map)
         if prostate_mask_dilated is not None:
-            # Zero out regions outside the dilated prostate mask
             viz_attention_map = viz_attention_map * prostate_mask_dilated
-        
-        return weighted_features, policy_log_prob.unsqueeze(1), viz_attention_map, None, None
+
+        return weighted_features, policy_log_prob.unsqueeze(1), viz_attention_map, None, action_indices_out
 
     def _bernoulli_forward(
         self,
         features: torch.Tensor,
-        attention_logits: torch.Tensor,
+        attention_logits: torch.Tensor,  # B x (Hc*Wc) — may be coarser than H×W
         attention_map: torch.Tensor,
-        B: int, H: int, W: int,
+        B: int, H: int, W: int,          # full feature-grid size
         deterministic: bool,
         action_indices: Optional[torch.Tensor],
         return_action_indices: bool,
         prostate_mask_dilated: Optional[torch.Tensor] = None,
+        coarse_H: Optional[int] = None,  # set when bernoulli_pool_stride > 1
+        coarse_W: Optional[int] = None,
+        coarse_mask_dilated: Optional[torch.Tensor] = None,
     ):
         """
         Bernoulli sampling over the 16x16 patch grid.
@@ -296,36 +370,59 @@ class PatchAttentionPolicy(nn.Module):
             None               : value (not used here)
             action_indices_out : (B, H*W) float binary mask, or None
         """
+        # Determine the actual spatial grid used for Bernoulli sampling
+        # When bernoulli_pool_stride > 1, attention_logits is already on the coarse grid.
+        Hb = coarse_H if coarse_H is not None else H
+        Wb = coarse_W if coarse_W is not None else W
+        mask_dilated_for_viz = coarse_mask_dilated if coarse_mask_dilated is not None else prostate_mask_dilated
+
         # Sigmoid probabilities — independent per patch, no competition
-        # attention_logits already has -inf applied outside prostate (from forward())
-        # Replace -inf with 0 so sigmoid(-inf)=0 (patch excluded deterministically)
         safe_logits = attention_logits.clone()
         safe_logits[safe_logits == float('-inf')] = -50.0  # sigmoid(-50) ≈ 0
-        probs_flat = torch.sigmoid(safe_logits)  # B x (H*W)
+        probs_flat = torch.sigmoid(safe_logits)  # B x (Hb*Wb)
 
-        # Build Bernoulli distribution
         dist = torch.distributions.Bernoulli(probs=probs_flat)
 
         if action_indices is not None:
-            # Replay path: recompute log_prob of stored mask under current policy
-            mask_flat = action_indices.float().to(probs_flat.device)  # B x (H*W)
+            mask_flat = action_indices.float().to(probs_flat.device)
+            deterministic_gate = False
         elif deterministic:
-            # Inference path: threshold → hard mask (equivalent to expected action)
-            mask_flat = (probs_flat > 0.5).float()  # B x (H*W)
+            # Deterministic inference should use smooth probabilities directly,
+            # not a hard 0.5 threshold that introduces patchy artifacts.
+            mask_flat = torch.ones_like(probs_flat)
+            deterministic_gate = True
         else:
-            # Training path: stochastic sample
-            mask_flat = dist.sample()  # B x (H*W)
+            mask_flat = dist.sample()
+            deterministic_gate = False
 
-        # Mean log-prob across spatial positions for numerical stability
-        # dist.log_prob returns (B, H*W); mean over H*W → (B,)
-        log_prob = dist.log_prob(mask_flat).mean(dim=1, keepdim=True)  # B x 1
+        # sqrt-normalised sum log-prob: restores per-logit gradient strength
+        # compared to plain mean (which dilutes by N_patches), while avoiding
+        # the astronomically large log-ratio magnitudes of plain sum.
+        N_b = Hb * Wb
+        per_patch_lp = dist.log_prob(mask_flat)                        # B x (Hb*Wb)
+        log_prob = per_patch_lp.sum(dim=1, keepdim=True) / N_b ** 0.5  # B x 1
 
-        # Reshape binary mask to spatial and gate features
-        mask_2d = mask_flat.view(B, 1, H, W)           # B x 1 x H x W
-        weighted_features = features * mask_2d          # B x hidden_dim x H x W
+        # Upsample coarse mask/probabilities to full feature grid for decoder modulation
+        mask_2d_coarse = mask_flat.view(B, 1, Hb, Wb)
+        probs_2d_coarse = probs_flat.view(B, 1, Hb, Wb)
 
-        # Visualisation map: smooth sigmoid probabilities (not binary mask)
-        viz_map = probs_flat.view(B, 1, H, W)
+        if Hb != H or Wb != W:
+            mask_2d = F.interpolate(mask_2d_coarse, size=(H, W), mode='nearest')
+            probs_2d = F.interpolate(probs_2d_coarse, size=(H, W), mode='bilinear', align_corners=False)
+        else:
+            mask_2d = mask_2d_coarse
+            probs_2d = probs_2d_coarse
+
+        # Decoder gating:
+        # - training / PPO replay: stochastic Bernoulli gate (probs * mask)
+        # - deterministic inference: smooth expected gate (probs)
+        if deterministic_gate:
+            weighted_features = features * probs_2d
+        else:
+            weighted_features = features * probs_2d * mask_2d    # B x hidden_dim x H x W
+
+        # Visualisation map at full resolution
+        viz_map = probs_2d.clone()
         if prostate_mask_dilated is not None:
             viz_map = viz_map * prostate_mask_dilated
 
