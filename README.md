@@ -1,16 +1,45 @@
 # Prost-RL
 
-Official implementation of **Prost-RL**: a reinforcement-learning framework for robust micro-ultrasound prostate cancer detection, built on the [ProstNFound+](https://github.com/DeepRCL/ProstNFound) backbone (MedSAM encoder–decoder with clinical prompts).
+Official implementation of **Prost-RL**: a reinforcement-learning framework for robust micro-ultrasound prostate cancer detection, built on the ProstNFound+ backbone (MedSAM encoder–decoder with clinical prompts).
+
+> 🏆 **Accepted at MICCAI 2026 (Early Accept — top 9%)**
 
 **Paper:** *Learning Where to Look: A Reinforcement Learning Framework for Robust Micro-Ultrasound Prostate Cancer Detection*
 
+**Authors:** Mohammad Mahdi Abootorabi, Sina Namazi, Armin Saadat, Lyuyang Wang, Obed Dzikunu, Paul F. R. Wilson, Zhuoxin Guo, Brian Wodlinger, Parvin Mousavi, Purang Abolmaesumi
+
+*The University of British Columbia · Queen's University · Vector Institute · Exact Imaging*
+
 ## Overview
 
-Prost-RL adds three components on top of ProstNFound+:
+Micro-ultrasound (µUS) is an emerging modality for prostate cancer (PCa) detection that operates at frequencies up to 29 MHz to resolve prostate micro-architecture with MRI-comparable accuracy. However, interpretation is highly experience-dependent, and supervision for training deep models is **sparse, noisy, and severely imbalanced** — typically limited to core-level histopathology (cancer grade and involvement percentage) without pixel-level lesion annotations.
 
-1. **Spatial attention policy** — learns where to attend before decoding.
-2. **Noise-robust supervision** — symmetric cross-entropy plus pixel entropy regularization for weak core-level labels.
-3. **Adaptive Policy Optimization (APO)** — DRPO fine-tuning with a pairwise ranking reward after supervised warm-up.
+**Prost-RL** reframes µUS PCa detection as a spatially aware, policy-driven inference problem by learning **where to look before decoding**. It integrates a lightweight reinforcement-learning policy into a foundation-model encoder–decoder to produce interpretable spatial attention maps that act as soft prompts for both cancer-likelihood heatmap prediction and image-level classification.
+
+
+<img width="5545" height="2365" alt="pipeline (1) (1)" src="https://github.com/user-attachments/assets/955b3998-a97f-4034-9125-b772fb53ac8c" />
+
+
+
+### Key contributions
+
+1. **Spatial attention policy** — a lightweight policy network πθ that generates an attention map α to modulate encoder features before they reach the heatmap decoder and csPCa classifier.
+2. **Noise-robust weakly supervised objective** — Symmetric Cross-Entropy (SCE) combined with pixel-level entropy regularization, mitigating noisy proportion labels and enforcing spatially sharp heatmaps.
+3. **Adaptive Policy Optimization (APO)** — a DRPO-based RL fine-tuning stage with a pairwise ranking reward (csPCa bonus γ=2), applied after supervised warm-up. Gaussian noise is injected into the attention logits to enable exploration over otherwise deterministic continuous attention.
+
+### Headline results
+
+On a multi-center retrospective cohort of **6,607 biopsy cores from 693 patients across five clinical sites** (patient-level five-fold cross-validation, center-stratified):
+
+| Task | Metric | ProstNFound+ | **Prost-RL (Ours)** |
+|------|--------|--------------|----------------------|
+| Core-level detection (all cores) | AUROC | 76.9 ± 3.5 | **79.0 ± 3.5** *** |
+| Core-level detection (all cores) | Sens@80%Spec | 60.1 ± 5.6 | **64.6 ± 6.3** * |
+| Core-level detection (high involvement) | AUROC | 83.6 ± 2.4 | **84.9 ± 2.5** |
+| csPCa classification head | AUROC | 78.5 ± 5.3 | **79.3 ± 5.8** |
+| csPCa classification head | Sens@80%Spec | 58.2 ± 10.6 | **62.8 ± 12.6** |
+
+\* p<0.05, \*\*\* p<0.001 (two-sided paired t-test over five folds).
 
 ## Repository layout
 
@@ -44,6 +73,8 @@ pip install -e ./medAI -e ./external_libs
 
 The NCT2013 micro-ultrasound cohort is accessed via `EXACTVU_PCA_DATA_ROOT` (must contain an `nct2013/` subdirectory with images, masks, and metadata). See [ClinicalTrials.gov NCT02079025](https://clinicaltrials.gov/study/NCT02079025) for the prospective trial this cohort derives from.
 
+The dataset contains B-mode sagittal-plane µUS images (depth 28 mm, width 46.06 mm) acquired with the ExactVu system, with core-level ISUP Grade Group and involvement labels. Images are resized to 256×256 and masks to 64×64 (matching attention-map resolution).
+
 Download [MedSAM](https://github.com/bowang-lab/MedSAM) weights and set:
 
 ```bash
@@ -65,6 +96,8 @@ export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$(pwd)"
 
 ### Stage 1 — supervised warm-up (35 epochs, batch size 8)
 
+Optimizes the noise-robust supervised objective `L_sup = L_SCE + L_ent + L_clf` (symmetric cross-entropy on the heatmap proportions, pixel-entropy regularizer over the prostate–needle intersection, and balanced CE on the classification head).
+
 | Fold | Config |
 |------|--------|
 | 0 | `cfg/train/experiments/ppo/supervised_baseline.yaml` |
@@ -81,6 +114,8 @@ python train_rl.py --config cfg/train/experiments/ppo/cross_fold/supervised_base
 Checkpoints are written under `checkpoints_supervised_cv/PPO-supervised-baseline-fold{N}/best_rl.pth`.
 
 ### Stage 2 — Prost-RL / EXP4 (35 epochs, batch size 16, DRPO)
+
+Jointly optimizes the DRPO policy loss alongside the supervised objectives. K=4 stochastic rollouts per image (Gaussian noise σ=0.15 injected into attention logits) drive pairwise-ranking-reward exploration, with hierarchical (cancer-vs-benign) advantage scaling to upweight rare positives and hard borderline lesions.
 
 | Fold | Config |
 |------|--------|
@@ -102,13 +137,13 @@ Outputs are saved to `checkpoints_supervised_cv/EXP4-pairwise-ranking-rl-fold{N}
 | Setting | Value |
 |---------|-------|
 | Loss | `symmetric_ce_entropy_reg` (α=β=1, ε=1e-4) |
-| RL algorithm | DRPO |
+| RL algorithm | DRPO (Domain-aware Group Relative Policy Optimization) |
 | Reward | `pairwise_ranking` (csPCa bonus γ=2) |
 | Rollouts K | 4 |
 | Attention noise σ | 0.15 |
 | RL loss weight | 0.8 |
-| Optimizer | AdamW, lr=2e-5, encoder lr=1e-5, wd=1e-3 |
-| Model selection | `val/core_auc_high_involvement` |
+| Optimizer | AdamW, lr=2e-5, encoder lr=1e-5, wd=1e-3, cosine annealing |
+| Model selection | `val/core_auc_high_involvement` (≥40% involvement) |
 
 ## Evaluation
 
@@ -124,16 +159,27 @@ python test_rl.py \
 
 Repeat for folds 1–4 with the matching checkpoint and `data.fold`. Optional: set `PNF_RL_CHECKPOINT` instead of the `checkpoint=` override.
 
+Core-level scores are computed as the mean heatmap activation within the needle–prostate intersection; image-level csPCa scores come from the classification head. We report AUROC and sensitivity at fixed specificities (80% by default; 60% also reported for the classification head).
+
+## Method at a glance
+
+Given an input image `x`, the MedSAM encoder produces spatial features `F = Enc(x) ∈ R^{C×H×W}`. The attention policy πθ processes `F` together with a clinical-metadata embedding `c` (age, PSA, PSAD, POS), gates `F` channel-wise, and produces spatial attention logits that are masked outside the prostate region and normalized to obtain `α`. Features are modulated via residual injection:
+
+```
+F̃ = F_proc ⊙ α
+E  = F + φ(F̃)
+```
+
+where `φ(·)` is a bias-free 1×1 projection with GELU. The shared modulated embeddings `E` feed both the heatmap decoder and the csPCa classifier; `α` is itself an interpretable spatial map of where the model attended.
+
+For weak proportional labels `q ∈ [0,1]` over the needle–prostate intersection, SCE replaces vanilla BCE to bound the gradient under model–label disagreement, and the pixel-entropy regularizer prevents the trivial "predict `q` everywhere" degeneracy by encouraging sharp, decisive heatmaps. APO then refines the policy with DRPO + pairwise ranking, where Gaussian noise on attention logits breaks the determinism of continuous spatial attention to enable rollout-based exploration.
+
 ## Citation
 
-If you use this code, please cite our paper (MICCAI 2025 submission) and the ProstNFound+ baseline:
+If you use this code, please cite our paper and the ProstNFound+ baseline:
 
 ```bibtex
-@inproceedings{abootorabi2025prostrl,
-  title={Learning Where to Look: A Reinforcement Learning Framework for Robust Micro-Ultrasound Prostate Cancer Detection},
-  author={Abootorabi, Mohammad Mahdi and Namazi, Sina and Saadat, Armin and Wang, Lyuyang and Dzikunu, Obed and Wilson, Paul F. R. and Guo, Zhuoxin and Wodlinger, Brian and Mousavi, Parvin and Abolmaesumi, Purang},
-  year={2025}
-}
+coming soon...
 ```
 
 ## License
@@ -142,4 +188,4 @@ Research code released for reproducibility. Dataset access is subject to the NCT
 
 ## Acknowledgments
 
-Built on [ProstNFound+](https://github.com/DeepRCL/ProstNFound), [MedSAM](https://github.com/bowang-lab/MedSAM), and the `medAI` training stack used in the ProstNFound line of work.
+This work was supported in part by the Canadian Institutes of Health Research (CIHR), the Natural Sciences and Engineering Research Council of Canada (NSERC), the Vector Institute, and through computational resources and services provided by Advanced Research Computing at the University of British Columbia. P. Mousavi is supported in part by a Canada CIFAR AI Chair and a Canada Research Chair.
