@@ -4,7 +4,7 @@ defaults:
 # === Model Settings (will be overridden by checkpoint) ===
 model: prostnfound_rl_adapter_medsam_legacy
 model_kw:
-  prompts: [age, psa]
+  prompts: [age, psa, psad, pos]
   use_class_decoder: true
   num_attention_points: 3
   policy_type: categorical
@@ -52,6 +52,7 @@ calibration_mode: null  # Options: "bag", "pixel", null
 
 # === Metrics ===
 include_patient_metrics: false
+report_balanced_accuracy: true
 
 # === Save Options ===
 save_checkpoint: false

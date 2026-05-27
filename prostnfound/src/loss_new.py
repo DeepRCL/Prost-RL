@@ -761,6 +761,139 @@ class DecoderProstateMaskConstraint(nn.Module):
         return data
 
 
+class AttentionAlignmentLoss(nn.Module):
+    """
+    Direct differentiable loss on the attention map — replaces RL reward with
+    a per-pixel gradient signal.
+    
+    For cancer cores (involvement > 0):
+      Encourage attention in the needle region proportional to involvement.
+      loss = -involvement * log(mean_attn_in_needle + eps)
+    
+    For benign cores (involvement == 0):
+      Penalize any attention in the needle region.
+      loss = mean_attn_in_needle^2  (quadratic to be soft near zero)
+    
+    This gives the policy a SPATIAL supervision signal that the standard MIL
+    loss does not: "where should you attend?" rather than "what's the label?"
+    """
+    
+    def __init__(self, cancer_weight: float = 1.0, benign_weight: float = 1.0):
+        super().__init__()
+        self.cancer_weight = cancer_weight
+        self.benign_weight = benign_weight
+    
+    def forward(self, data: dict):
+        if 'rl_attention_map' not in data:
+            return torch.tensor(0.0, device=data['cancer_logits'].device)
+        
+        attention_map = data['rl_attention_map']
+        device = attention_map.device
+        B = attention_map.shape[0]
+        
+        if attention_map.ndim == 4:
+            attention = attention_map.squeeze(1)
+        else:
+            attention = attention_map
+        
+        needle_mask = data['needle_mask'].to(device)
+        if needle_mask.shape[-2:] != attention.shape[-2:]:
+            needle_mask = F.interpolate(
+                needle_mask.float(), size=attention.shape[-2:], mode='nearest'
+            )
+        if needle_mask.ndim == 4:
+            needle_mask = needle_mask.squeeze(1)
+        
+        prostate_mask = data.get('prostate_mask', None)
+        if prostate_mask is not None:
+            prostate_mask = prostate_mask.to(device)
+            if prostate_mask.shape[-2:] != attention.shape[-2:]:
+                prostate_mask = F.interpolate(
+                    prostate_mask.float(), size=attention.shape[-2:], mode='nearest'
+                )
+            if prostate_mask.ndim == 4:
+                prostate_mask = prostate_mask.squeeze(1)
+        
+        involvement = data['involvement'].to(device).float()
+        if involvement.ndim > 1:
+            involvement = involvement.squeeze(-1)
+        
+        eps = 1e-6
+        loss = torch.tensor(0.0, device=device)
+        
+        for i in range(B):
+            needle_i = needle_mask[i] > 0.5
+            if prostate_mask is not None:
+                valid_i = needle_i & (prostate_mask[i] > 0.5)
+            else:
+                valid_i = needle_i
+            
+            if valid_i.sum() == 0:
+                continue
+            
+            mean_attn_needle = attention[i][valid_i].mean()
+            inv_i = involvement[i].item()
+            
+            if inv_i > 0:
+                target_attn = min(inv_i, 1.0)
+                sample_loss = (mean_attn_needle - target_attn) ** 2
+                loss = loss + self.cancer_weight * sample_loss
+            else:
+                loss = loss + self.benign_weight * (mean_attn_needle ** 2)
+        
+        return loss / max(B, 1)
+
+
+class StochasticAttentionRegularizationLoss(nn.Module):
+    """
+    Stochastic Attention Regularization (SAR): adds noise to attention during
+    supervised training and penalizes output inconsistency.
+    
+    Key idea: during training, run the decoder twice — once with clean attention,
+    once with noisy attention — and add a consistency loss between outputs.
+    This teaches the decoder to be ROBUST to attention variation, improving
+    generalization without any RL.
+    
+    The loss is the KL divergence between the clean and noisy decoder outputs
+    (applied to the needle region predictions).
+    
+    NOTE: This loss requires a special forward mode in the training loop that
+    provides both 'cancer_logits' (clean) and 'cancer_logits_noisy' (noisy).
+    If 'cancer_logits_noisy' is not present, returns 0 (graceful fallback).
+    """
+    
+    def __init__(self, consistency_weight: float = 1.0):
+        super().__init__()
+        self.consistency_weight = consistency_weight
+    
+    def forward(self, data: dict):
+        if 'cancer_logits_noisy' not in data:
+            return torch.tensor(0.0, device=data['cancer_logits'].device)
+        
+        clean_logits = data['cancer_logits']
+        noisy_logits = data['cancer_logits_noisy']
+        device = clean_logits.device
+        
+        prostate_mask = data['prostate_mask'].to(device)
+        needle_mask = data['needle_mask'].to(device)
+        
+        masks = (prostate_mask > 0.5) & (needle_mask > 0.5)
+        
+        clean_preds, batch_idx = MaskedPredictionModule()(clean_logits, masks)
+        noisy_preds, _ = MaskedPredictionModule()(noisy_logits, masks)
+        
+        if len(clean_preds) == 0:
+            return torch.tensor(0.0, device=device)
+        
+        clean_probs = clean_preds.sigmoid().clamp(1e-6, 1 - 1e-6)
+        noisy_probs = noisy_preds.sigmoid().clamp(1e-6, 1 - 1e-6)
+        
+        kl_div = clean_probs * (clean_probs.log() - noisy_probs.log()) + \
+                 (1 - clean_probs) * ((1 - clean_probs).log() - (1 - noisy_probs).log())
+        
+        return self.consistency_weight * kl_div.mean()
+
+
 class DecoderProstateMaskLoss(nn.Module):
     """
     Wrapper that applies hard prostate mask constraint and then computes loss.
@@ -927,6 +1060,22 @@ def build_loss(args):
         print(f"Adding image-level classification loss: {args.add_image_clf}")
         class_weight = args.get('image_clf_class_weight', 'balanced')
         losses.append(ImageLevelClassificationLoss(mode=args.image_clf_mode, class_weight=class_weight))
+
+    # Attention Alignment Loss: direct differentiable spatial attention supervision
+    attn_align_weight = args.get('attention_alignment_weight', 0.0)
+    if attn_align_weight > 0:
+        print(f"Adding Attention Alignment Loss with weight={attn_align_weight}")
+        attn_align_kw = args.get('attention_alignment_kw', {})
+        losses.append(AttentionAlignmentLoss(
+            cancer_weight=attn_align_kw.get('cancer_weight', 1.0) * attn_align_weight,
+            benign_weight=attn_align_kw.get('benign_weight', 1.0) * attn_align_weight,
+        ))
+
+    # Stochastic Attention Regularization: consistency loss under attention noise
+    sar_weight = args.get('sar_weight', 0.0)
+    if sar_weight > 0:
+        print(f"Adding Stochastic Attention Regularization with weight={sar_weight}")
+        losses.append(StochasticAttentionRegularizationLoss(consistency_weight=sar_weight))
 
     # SOFT penalty (legacy approach - NOT recommended for consistency with RL)
     if args.outside_prostate_penalty:

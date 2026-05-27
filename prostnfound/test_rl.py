@@ -1,8 +1,4 @@
-"""
-Test script for ProstNFound-RL models
-
-This is adapted from test.py to support RL models with attention mechanisms.
-"""
+"""Evaluation script for Prost-RL checkpoints."""
 
 import argparse
 from collections import defaultdict
@@ -74,8 +70,6 @@ def main(args):
         # Keep test robust to unexpected checkpoint formats.
         train_args = Namespace()
 
-    # IMPORTANT: Always use the model config from the checkpoint
-    # This ensures we load the correct RL model architecture
     checkpoint_model = getattr(train_args, "model", None)
     checkpoint_model_kw = getattr(train_args, "model_kw", None)
 
@@ -105,10 +99,6 @@ def main(args):
     # Convert to plain dict to allow modification (OmegaConf struct mode blocks new keys)
     model_kw = dict(checkpoint_model_kw or {})
     
-    # Detect legacy checkpoints that don't have policy_arch_version.
-    # IMPORTANT: policy_arch_version is RL-specific and only valid for V1 RL
-    # models (prostnfound_rl). It must NEVER be injected into baseline
-    # prostnfound models.
     model_name = str(args.model)
     is_rl_model_name = "prostnfound_rl" in model_name
     is_v2_rl_model_name = "rl_v2" in model_name
@@ -204,11 +194,13 @@ def main(args):
         )
 
     evaluator = Evaluator(
-        log_images=False, include_patient_metrics=args.get('include_patient_metrics', False)
+        log_images=False,
+        include_patient_metrics=args.get('include_patient_metrics', False),
+        include_balanced_accuracy=args.get("report_balanced_accuracy", True),
     )
     accumulator = defaultdict(list)
-    # Track high prediction cases (used for logging/debug across model types)
-    high_prediction_cases = []
+    # Track cancer-only prediction cases for ranking reports.
+    ranked_cancer_cases = []
     
     # For RL models, also accumulate attention point statistics
     if is_rl_model:
@@ -329,6 +321,9 @@ def main(args):
             # For both discrete and continuous: store attention maps
             if 'rl_attention_map' in data and data['rl_attention_map'] is not None:
                 rl_accumulator['attention_maps'].append(data['rl_attention_map'].cpu())
+            # Store bbox coordinates for analysis
+            if 'rl_bbox' in data and data['rl_bbox'] is not None:
+                rl_accumulator['bboxes'].append(data['rl_bbox'].cpu())
             # Store masks for Needle Focus Ratio metric
             if 'needle_mask' in data:
                 rl_accumulator['needle_mask'].append(data['needle_mask'].cpu())
@@ -389,11 +384,16 @@ def main(args):
         else:
             display_aspect_ratio = img_w / img_h  # Will be 1.0 for 256x256
         
-        # Detect if we need 3-panel layout (for continuous V2 models)
+        # Detect if we need 3-panel layout (for continuous/bbox V2 models)
         is_v2_model = False
         is_continuous_v2 = False
+        is_bbox_v2 = False
         try:
-            if hasattr(base_model, 'discrete_attention'):
+            if hasattr(base_model, 'attention_mode'):
+                is_v2_model = True
+                is_continuous_v2 = base_model.attention_mode in ('continuous', 'bernoulli')
+                is_bbox_v2 = base_model.attention_mode == 'bbox'
+            elif hasattr(base_model, 'discrete_attention'):
                 is_v2_model = True
                 is_continuous_v2 = not base_model.discrete_attention
         except:
@@ -402,7 +402,7 @@ def main(args):
         # Calculate figure size preserving original aspect ratio
         fig_height = 5
         # Width for panels side by side, preserving aspect ratio
-        num_panels = 3 if (is_rl_model and is_continuous_v2) else 2
+        num_panels = 3 if (is_rl_model and (is_continuous_v2 or is_bbox_v2)) else 2
         fig_width = fig_height * display_aspect_ratio * num_panels + 1
         fig, ax = plt.subplots(1, num_panels, figsize=(fig_width, fig_height))
         
@@ -441,7 +441,7 @@ def main(args):
         
         # Panel 1 (middle): RL Attention Map OR Decoder Heatmap (depending on model type)
         # For continuous V2: Show RL attention, For others: Show decoder heatmap
-        if is_rl_model and is_continuous_v2:
+        if is_rl_model and (is_continuous_v2 or is_bbox_v2):
             # Middle panel: RL Attention Map
             if 'rl_attention_map' in data and data['rl_attention_map'] is not None:
                 attn_map = data['rl_attention_map'][0].detach().cpu().numpy()
@@ -480,7 +480,8 @@ def main(args):
                         ax[1].contour(prostate_mask_display, colors='cyan', alpha=0.5, linewidths=1.5, levels=[0.5])
                     
                     plt.colorbar(im, ax=ax[1], fraction=0.046, pad=0.04)
-                    ax[1].set_title('RL Attention Map', fontsize=11, pad=5)
+                    title_str = 'RL Bbox Attention' if is_bbox_v2 else 'RL Attention Map'
+                    ax[1].set_title(title_str, fontsize=11, pad=5)
                 else:
                     # Fallback
                     if original_aspect_ratio is not None:
@@ -596,7 +597,7 @@ def main(args):
         # Panel 2 (right): Decoder Output Heatmap (for continuous V2)
         # For continuous V2, this is the rightmost panel showing final decoder predictions
         # For other models, overlay attention points on the heatmap panel
-        if is_rl_model and is_continuous_v2:
+        if is_rl_model and (is_continuous_v2 or is_bbox_v2):
             # Right panel: Decoder output heatmap
             if heatmap is not None:
                 # Resize heatmap to match display
@@ -643,6 +644,51 @@ def main(args):
         
         # Overlay attention points/patches if RL model (for discrete modes)
         if is_rl_model:
+            # Overlay bbox if bbox mode
+            if is_bbox_v2 and 'rl_bbox' in data and data['rl_bbox'] is not None:
+                bbox = data['rl_bbox'][0].detach().cpu().numpy()  # (4,) in pixel coords [x1,y1,x2,y2]
+                try:
+                    if hasattr(base_model, 'policy') and hasattr(base_model.policy, 'image_size'):
+                        model_image_size = base_model.policy.image_size
+                    else:
+                        model_image_size = 256
+                except:
+                    model_image_size = 256
+                
+                scale_x = img_w / model_image_size
+                scale_y = img_h / model_image_size
+                bx1 = bbox[0] * scale_x
+                by1 = bbox[1] * scale_y
+                bx2 = bbox[2] * scale_x
+                by2 = bbox[3] * scale_y
+                bw = bx2 - bx1
+                bh = by2 - by1
+                
+                # Draw bbox on B-mode panel (0)
+                rect0 = Rectangle((bx1, by1), bw, bh,
+                    linewidth=2.5, edgecolor='lime', facecolor='none',
+                    linestyle='-', zorder=10)
+                ax[0].add_patch(rect0)
+                
+                # Draw bbox on attention map panel (1)
+                rect1 = Rectangle((bx1, by1), bw, bh,
+                    linewidth=2.5, edgecolor='lime', facecolor='none',
+                    linestyle='-', zorder=10)
+                ax[1].add_patch(rect1)
+                
+                # Draw bbox on decoder heatmap panel (2)
+                rect2 = Rectangle((bx1, by1), bw, bh,
+                    linewidth=2.5, edgecolor='lime', facecolor='none',
+                    linestyle='--', zorder=10)
+                ax[2].add_patch(rect2)
+                
+                # Add size annotation
+                area_pct = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / (model_image_size ** 2) * 100
+                ax[1].text(bx1, by1 - 3, f'Bbox ({area_pct:.0f}%)',
+                    color='lime', fontsize=8, ha='left', va='bottom',
+                    bbox=dict(boxstyle='round,pad=0.2', fc='black', alpha=0.6),
+                    zorder=11)
+            
             # Detect if V2 model (patch-based)
             is_discrete_v2 = False
             try:
@@ -777,27 +823,18 @@ def main(args):
         )
         plt.close()
         
-        # Track high prediction cases for logging
-        if cls_score is not None and cls_score > 0.4:
-            high_prediction_cases.append({
-                'core_id': core_id,
-                'patient_id': patient_id,
-                'cls_score': cls_score,
-                'roi_avg': roi_avg if roi_avg is not None else 'N/A',
-                'gt_label': 'Cancer' if gt_label else 'Benign',
-                'gt_involvement': gt_involvement,
-                'type': 'CLS'
-            })
-        elif roi_avg is not None and roi_avg > 0.4:
-            high_prediction_cases.append({
-                'core_id': core_id,
-                'patient_id': patient_id,
-                'cls_score': cls_score if cls_score is not None else 'N/A',
-                'roi_avg': roi_avg,
-                'gt_label': 'Cancer' if gt_label else 'Benign',
-                'gt_involvement': gt_involvement,
-                'type': 'ROI'
-            })
+        # Track only ground-truth cancer cases; ranking is done after the loop.
+        if gt_label:
+            ranked_cancer_cases.append(
+                {
+                    "core_id": core_id,
+                    "patient_id": patient_id,
+                    "cls_score": cls_score,
+                    "roi_avg": roi_avg,
+                    "gt_label": "Cancer",
+                    "gt_involvement": gt_involvement,
+                }
+            )
         
         # Accumulate metrics for this batch
         evaluator(data)
@@ -805,26 +842,59 @@ def main(args):
     table = evaluator.accumulator.compute()
     table.to_csv(os.path.join(args.output_dir, "metrics_by_core.csv"))
     
-    # Log high prediction cases
-    if is_rl_model and len(high_prediction_cases) > 0:
-        print(f"\n=== High Prediction Cases (CLS or ROI > 40%) ===")
-        print(f"Found {len(high_prediction_cases)} cases with high predictions:")
-        for case in high_prediction_cases[:20]:  # Show first 20
-            cls_str = f"{case['cls_score']:.1%}" if isinstance(case['cls_score'], float) else str(case['cls_score'])
-            roi_str = f"{case['roi_avg']:.1%}" if isinstance(case['roi_avg'], float) else str(case['roi_avg'])
-            print(f"  {case['patient_id']}/{case['core_id']}: "
-                  f"CLS={cls_str}, ROI={roi_str}, "
-                  f"GT={case['gt_label']} (Inv: {case['gt_involvement']:.1%})")
-        if len(high_prediction_cases) > 20:
-            print(f"  ... and {len(high_prediction_cases) - 20} more")
-        
-        # Save to CSV
-        import pandas as pd
-        df_high_preds = pd.DataFrame(high_prediction_cases)
+    # Log and save cancer-only ranked cases:
+    # 1) top ROI averages among cancers, then
+    # 2) top classification scores among cancers.
+    if is_rl_model and len(ranked_cancer_cases) > 0:
+        df_cancer = pd.DataFrame(ranked_cancer_cases)
+
+        top_roi = (
+            df_cancer[df_cancer["roi_avg"].notna()]
+            .sort_values("roi_avg", ascending=False)
+            .copy()
+        )
+        top_roi["type"] = "ROI"
+
+        top_cls = (
+            df_cancer[df_cancer["cls_score"].notna()]
+            .sort_values("cls_score", ascending=False)
+            .copy()
+        )
+        top_cls["type"] = "CLS"
+
+        df_high_preds = pd.concat([top_roi, top_cls], ignore_index=True)
+
+        print("\n=== Ranked Cancer Prediction Cases ===")
+        print(
+            f"Top ROI cancer rows: {len(top_roi)} | "
+            f"Top CLS cancer rows: {len(top_cls)}"
+        )
+        for _, case in df_high_preds.head(20).iterrows():
+            cls_str = (
+                f"{case['cls_score']:.1%}"
+                if pd.notna(case["cls_score"])
+                else "N/A"
+            )
+            roi_str = (
+                f"{case['roi_avg']:.1%}"
+                if pd.notna(case["roi_avg"])
+                else "N/A"
+            )
+            print(
+                f"  [{case['type']}] {case['patient_id']}/{case['core_id']}: "
+                f"CLS={cls_str}, ROI={roi_str}, "
+                f"GT={case['gt_label']} (Inv: {case['gt_involvement']:.1%})"
+            )
+        if len(df_high_preds) > 20:
+            print(f"  ... and {len(df_high_preds) - 20} more")
+
         df_high_preds.to_csv(
             os.path.join(args.output_dir, "high_prediction_cases.csv"), index=False
         )
-        print(f"\nSaved high prediction cases to: {os.path.join(args.output_dir, 'high_prediction_cases.csv')}")
+        print(
+            "\nSaved high prediction cases to: "
+            f"{os.path.join(args.output_dir, 'high_prediction_cases.csv')}"
+        )
 
     metrics = evaluator.aggregate_metrics()
     metrics["infer_time"] = np.array(accumulator["infer_time"]).mean()

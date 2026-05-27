@@ -202,6 +202,39 @@ out_pirads.csv
 Seg-R1/
 submit.sh
 readMes/
-# plots/
 outputs_v2/
 GDPO/
+exp*/
+exp5/
+*.pdf
+_MICCAI*
+pnf/
+pnf+/
+sam/
+
+# Local analysis / drafts (not part of public release)
+x.tex
+Doc.MD
+stat_sig_test.py
+slurm-*.log
+
+# Training artifacts
+checkpoints/
+checkpoints_rl/
+checkpoints_rl*/
+checkpoints_supervised_cv/
+checkpoints_supervised_cv*/
+checkpoints_supervised_cv-rl-finetune/
+prostnfound/checkpoints*/
+prostnfound/outputs/
+prostnfound/outputs*/
+prostnfound/outputs_ablations/
+prostnfound/outputs_v3/
+prostnfound/plots/
+prostnfound/wandb/
+prostnfound/notebooks/
+prostnfound/ensemble_experiments/
+prostnfound/*.pdf
+prostnfound/out.csv
+prostnfound/out_pirads.csv
+wandb/

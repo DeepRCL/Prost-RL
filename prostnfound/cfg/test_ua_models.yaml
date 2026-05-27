@@ -59,8 +59,41 @@ models:
   #   output_subdir: V3-PPO-thresholded_involvement_entropy_reg
   #   overrides: []
   
-  - name: V3-PNF-SUPERVISED-TopKMIL
+  # - name: PPO-supervised-baseline
+  #   enabled: true
+  #   checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_rl_v3/PPO-supervised-baseline/best_rl.pth
+  #   output_subdir: PPO-supervised-baseline
+  #   overrides: []
+
+  # - name: pnfplus-final
+  #   enabled: true
+  #   checkpoint: /home/sinanmz/prostate/Prostnfound-RL/prostnfound/checkpoints_with_prompts_baseline/best.pth
+  #   output_subdir: pnfplus-final
+  #   overrides: []
+
+  # - name: ppo-supervised-init-policy-only
+  #   enabled: true
+  #   checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_rl_v3/PPO-supervised-init-policy-only/best_rl.pth
+  #   output_subdir: ppo-supervised-init-policy-only
+  #   overrides: []
+
+  # - name: EXP5-conservative-rl-finetune-fold0
+  #   enabled: true
+  #   checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_supervised_cv-rl-finetune/EXP5-conservative-rl-finetune-fold0/best_rl.pth
+  #   output_subdir: EXP5-conservative-rl-finetune-fold0
+  #   overrides: []
+
+  # - name: V3-DRPO-3phase-alternating-joint-highnoise
+  #   enabled: true
+  #   checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_rl_v3/V3-DRPO-3phase-alternating-joint-highnoise/best_rl.pth
+  #   output_subdir: V3-DRPO-3phase-alternating-joint-highnoise
+  #   overrides: []
+
+
+  - name: RL
     enabled: true
-    checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_rl_v2/V3-PNF-SUPERVISED-TopKMIL/best_rl.pth
-    output_subdir: V3-PNF-SUPERVISED-TopKMIL
+    checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_supervised_cv/EXP4-pairwise-ranking-rl-fold1/best_rl.pth
+    output_subdir: EXP4-pairwise-ranking-rl-fold1
     overrides: []
+
+    

@@ -60,6 +60,15 @@ class RLRewardComputer:
         classification_reward_weight: float = 0.5,
         diversity_reward_weight: float = 0.0,  # Diversity bonus (prevents policy collapse)
         benign_sparsity_penalty_weight: float = 0.0,  # Penalize high attention in benign cases
+        bbox_area_penalty_weight: float = 0.0,  # Penalize bbox covering entire prostate (anti-collapse)
+        bbox_target_area_fraction: float = 0.25,  # Target bbox area as fraction of image (below this = no penalty)
+        sensitivity_pos_weight: float = 1.0,  # Base weight for all positive samples
+        sensitivity_high_inv_threshold: float = 0.40,  # High-involvement threshold
+        sensitivity_high_inv_extra_weight: float = 1.0,  # Extra weight for high involvement
+        sensitivity_cspca_extra_weight: float = 1.0,  # Extra weight for csPCa
+        sensitivity_fn_prob_margin: float = 0.65,  # Penalize positives with p(pos) below this
+        sensitivity_fn_penalty_weight: float = 1.0,  # Weight of false-negative penalty
+        sensitivity_negative_weight: float = 0.35,  # Downweight benign reward to bias sensitivity
     ):
         self.reward_mode = reward_mode
         self.cspca_bonus = cspca_bonus
@@ -70,6 +79,15 @@ class RLRewardComputer:
         self.classification_reward_weight = classification_reward_weight
         self.diversity_reward_weight = diversity_reward_weight
         self.benign_sparsity_penalty_weight = benign_sparsity_penalty_weight
+        self.bbox_area_penalty_weight = bbox_area_penalty_weight
+        self.bbox_target_area_fraction = bbox_target_area_fraction
+        self.sensitivity_pos_weight = sensitivity_pos_weight
+        self.sensitivity_high_inv_threshold = sensitivity_high_inv_threshold
+        self.sensitivity_high_inv_extra_weight = sensitivity_high_inv_extra_weight
+        self.sensitivity_cspca_extra_weight = sensitivity_cspca_extra_weight
+        self.sensitivity_fn_prob_margin = sensitivity_fn_prob_margin
+        self.sensitivity_fn_penalty_weight = sensitivity_fn_penalty_weight
+        self.sensitivity_negative_weight = sensitivity_negative_weight
     
     def compute_roi_involvement_reward(
         self,
@@ -181,6 +199,69 @@ class RLRewardComputer:
             rewards.append(reward)
         
         return torch.tensor(rewards, device=device)
+
+    def compute_highinv_cspca_sensitivity_reward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Sensitivity-focused classification reward.
+
+        Design goal:
+        - Strongly reward high p(positive) on positive cores
+        - Add extra pressure for high-involvement and csPCa positives
+        - Explicitly penalize false negatives (low p(positive) on positives)
+        - Keep a weaker benign term to avoid complete specificity collapse
+        """
+        if 'image_level_classification_outputs' not in outputs:
+            B = outputs['cancer_logits'].shape[0]
+            return torch.zeros(B, device=outputs['cancer_logits'].device)
+
+        cls_logits = outputs['image_level_classification_outputs'][0]
+        device = cls_logits.device
+        probs = F.softmax(cls_logits, dim=1)
+
+        # Binary positive probability (assumes class index 1 is positive).
+        p_pos = probs[:, 1] if probs.shape[1] > 1 else probs[:, 0]
+
+        if 'grade_group' in data:
+            pos_labels = (data['grade_group'].to(device) > 2).float()
+            cspca_mask = pos_labels > 0.5
+        else:
+            pos_labels = data['label'].to(device).float()
+            if pos_labels.ndim > 1:
+                pos_labels = pos_labels.squeeze(-1)
+            cspca_mask = torch.zeros_like(pos_labels, dtype=torch.bool)
+
+        if pos_labels.ndim > 1:
+            pos_labels = pos_labels.squeeze(-1)
+
+        involvement = data.get('involvement', None)
+        if involvement is None:
+            involvement = torch.zeros_like(pos_labels, device=device)
+        else:
+            involvement = involvement.to(device).float()
+            if involvement.ndim > 1:
+                involvement = involvement.squeeze(-1)
+
+        pos_mask = pos_labels > 0.5
+        neg_mask = ~pos_mask
+        high_inv_mask = involvement >= self.sensitivity_high_inv_threshold
+
+        # Positive branch: reward high p_pos, penalize low p_pos (FN-like behavior).
+        pos_reward = 2.0 * p_pos - 1.0
+        pos_scale = torch.full_like(p_pos, self.sensitivity_pos_weight)
+        pos_scale = pos_scale + self.sensitivity_high_inv_extra_weight * (high_inv_mask & pos_mask).float()
+        pos_scale = pos_scale + self.sensitivity_cspca_extra_weight * (cspca_mask & pos_mask).float()
+        fn_penalty = torch.clamp(self.sensitivity_fn_prob_margin - p_pos, min=0.0)
+        pos_reward = pos_scale * pos_reward - self.sensitivity_fn_penalty_weight * fn_penalty
+
+        # Negative branch: preserve some specificity pressure, but weaker.
+        neg_reward = self.sensitivity_negative_weight * (2.0 * (1.0 - p_pos) - 1.0)
+
+        rewards = torch.where(pos_mask, pos_reward, neg_reward)
+        return torch.clamp(rewards, min=-4.0, max=4.0)
     
     def compute_combined_v2_reward(
         self,
@@ -799,6 +880,73 @@ class RLRewardComputer:
         
         return is_correct
     
+    def compute_pairwise_ranking_reward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        data: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Pairwise ranking reward that directly optimizes AUC.
+        
+        AUC = P(score(positive) > score(negative)) for random pairs.
+        Standard rewards (confidence-based) optimize per-sample accuracy,
+        but the evaluation metric is AUC — a RANKING metric.
+        
+        For each sample i, the reward is the average pairwise correctness:
+          If i is positive: reward = mean(p_i > p_j for all negative j in batch)
+          If i is negative: reward = mean(p_j > p_i for all positive j in batch)
+        
+        This provides signal about the model's RELATIVE ranking ability, which
+        BCE/CE losses don't directly optimize.
+        """
+        if 'image_level_classification_outputs' not in outputs:
+            B = outputs.get('cancer_logits', outputs.get('mask_logits')).shape[0]
+            return torch.zeros(B, device=outputs.get('cancer_logits', outputs.get('mask_logits')).device)
+        
+        cls_logits = outputs['image_level_classification_outputs'][0]
+        device = cls_logits.device
+        B = cls_logits.shape[0]
+        
+        probs = F.softmax(cls_logits, dim=1)
+        p_pos = probs[:, 1] if probs.shape[1] > 1 else probs[:, 0]
+        
+        if 'grade_group' in data:
+            labels = (data['grade_group'].to(device) > 2).float()
+        else:
+            labels = data['label'].to(device).float()
+        if labels.ndim > 1:
+            labels = labels.squeeze(-1)
+        
+        pos_mask = labels > 0.5
+        neg_mask = ~pos_mask
+        
+        n_pos = pos_mask.sum().item()
+        n_neg = neg_mask.sum().item()
+        
+        if n_pos == 0 or n_neg == 0:
+            return self.compute_classification_reward(outputs, data)
+        
+        pos_scores = p_pos[pos_mask]
+        neg_scores = p_pos[neg_mask]
+        
+        rewards = torch.zeros(B, device=device)
+        
+        for i in range(B):
+            if labels[i] > 0.5:
+                correct_pairs = (p_pos[i] > neg_scores).float().mean()
+                rewards[i] = 2.0 * correct_pairs - 1.0
+            else:
+                correct_pairs = (pos_scores > p_pos[i]).float().mean()
+                rewards[i] = 2.0 * correct_pairs - 1.0
+        
+        if 'grade_group' in data:
+            cspca_mask = data['grade_group'].to(device) > 2
+            if cspca_mask.ndim > 1:
+                cspca_mask = cspca_mask.squeeze(-1)
+            rewards = torch.where(cspca_mask, rewards * self.cspca_bonus, rewards)
+        
+        return rewards
+
     def compute_confidence_based_reward(
         self,
         cancer_logits: torch.Tensor,
@@ -1042,6 +1190,45 @@ class RLRewardComputer:
         penalties = torch.tensor(penalties, device=device)
         return self.prostate_boundary_penalty_weight * penalties
     
+    def compute_bbox_area_penalty(
+        self,
+        bbox_coords: torch.Tensor,
+        image_size: float = 256.0,
+    ) -> torch.Tensor:
+        """
+        Compute penalty for bounding boxes that are too large.
+        
+        Prevents the model from collapsing to always predicting a bbox covering
+        the entire prostate. Penalty is proportional to how much the bbox area
+        exceeds the target fraction of image area.
+        
+        Penalty = max(0, area_fraction - target)^2
+        
+        This only penalizes boxes LARGER than the target, not smaller ones
+        (we want the model to potentially focus on small cancer regions).
+        
+        Args:
+            bbox_coords: Bounding box coordinates (B, 4) in pixel coords [x1, y1, x2, y2]
+            image_size: Image resolution (default: 256)
+            
+        Returns:
+            penalties: Area penalty per sample (B,), in [0, 1] range
+        """
+        device = bbox_coords.device
+        B = bbox_coords.shape[0]
+        
+        # Compute area fraction for each bbox
+        widths = (bbox_coords[:, 2] - bbox_coords[:, 0]) / image_size   # normalized width
+        heights = (bbox_coords[:, 3] - bbox_coords[:, 1]) / image_size  # normalized height
+        area_fraction = widths * heights  # fraction of total image area
+        
+        # Penalty = max(0, area_fraction - target)^2
+        # Only penalizes boxes larger than target; small focused boxes are fine
+        excess = torch.clamp(area_fraction - self.bbox_target_area_fraction, min=0.0)
+        penalties = excess ** 2  # quadratic penalty for smoother gradients
+        
+        return penalties
+    
     def __call__(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -1071,6 +1258,8 @@ class RLRewardComputer:
             rewards = self.compute_confidence_based_reward(cancer_logits, data)
         elif self.reward_mode == 'classification_only':
             rewards = self.compute_classification_reward(outputs, data)
+        elif self.reward_mode == 'highinv_cspca_sensitivity':
+            rewards = self.compute_highinv_cspca_sensitivity_reward(outputs, data)
         elif self.reward_mode == 'roi_only':
             rewards = self.compute_roi_involvement_reward(cancer_logits, data)
         elif self.reward_mode == 'attention_proportional':
@@ -1083,6 +1272,8 @@ class RLRewardComputer:
             rewards = self.compute_attention_contrast_reward(outputs, data)
         elif self.reward_mode == 'hierarchical_gated':
             rewards = self.compute_hierarchical_gated_reward(outputs, data)
+        elif self.reward_mode == 'pairwise_ranking':
+            rewards = self.compute_pairwise_ranking_reward(outputs, data)
         else:
             # Legacy modes
             if self.reward_mode == 'loss_based':
@@ -1120,6 +1311,12 @@ class RLRewardComputer:
             rl_attention_map = outputs['rl_attention_map']
             sparsity_penalty = self.compute_benign_sparsity_penalty(rl_attention_map, data)
             rewards = rewards - self.benign_sparsity_penalty_weight * sparsity_penalty
+        
+        # Apply bbox area penalty if enabled (prevents bbox from covering entire prostate)
+        if self.bbox_area_penalty_weight > 0 and 'rl_bbox' in outputs:
+            bbox_coords = outputs['rl_bbox']  # (B, 4) in pixel coords
+            area_penalty = self.compute_bbox_area_penalty(bbox_coords)
+            rewards = rewards - self.bbox_area_penalty_weight * area_penalty
         
         # Normalize if requested (usually disabled for GRPO)
         if self.normalize_rewards and rewards.numel() > 1:
@@ -1252,10 +1449,15 @@ class RLRewardComputer:
         elif self.reward_mode == 'classification_only':
             # Classification only: no attention component
             attn_reward = torch.zeros_like(cls_reward)
+        elif self.reward_mode == 'highinv_cspca_sensitivity':
+            cls_reward = self.compute_highinv_cspca_sensitivity_reward(outputs, data)
+            attn_reward = torch.zeros_like(cls_reward)
         elif self.reward_mode == 'hierarchical_gated':
             attn_reward = self.compute_hierarchical_gated_reward(outputs, data)
-            # Gated reward combines both, approximate separation
             attn_reward = attn_reward - cls_reward * (attn_reward > 0).float()
+        elif self.reward_mode == 'pairwise_ranking':
+            cls_reward = self.compute_pairwise_ranking_reward(outputs, data)
+            attn_reward = torch.zeros_like(cls_reward)
         else:
             # Default: compute as in __call__ but extract components
             total = self(outputs, data, num_samples_per_image)
@@ -1335,6 +1537,15 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
     # Benign sparsity penalty (encourages sparse attention in benign cases)
     benign_sparsity_penalty_weight = args.get('rl_benign_sparsity_penalty_weight', 0.0)
     
+    # Sensitivity-focused classification reward parameters
+    sensitivity_pos_weight = args.get('rl_sensitivity_pos_weight', 1.0)
+    sensitivity_high_inv_threshold = args.get('rl_sensitivity_high_inv_threshold', 0.40)
+    sensitivity_high_inv_extra_weight = args.get('rl_sensitivity_high_inv_extra_weight', 1.0)
+    sensitivity_cspca_extra_weight = args.get('rl_sensitivity_cspca_extra_weight', 1.0)
+    sensitivity_fn_prob_margin = args.get('rl_sensitivity_fn_prob_margin', 0.65)
+    sensitivity_fn_penalty_weight = args.get('rl_sensitivity_fn_penalty_weight', 1.0)
+    sensitivity_negative_weight = args.get('rl_sensitivity_negative_weight', 0.35)
+    
     return RLRewardComputer(
         reward_mode=reward_mode,
         cspca_bonus=cspca_bonus,
@@ -1345,4 +1556,14 @@ def build_rl_reward_computer(args) -> RLRewardComputer:
         classification_reward_weight=classification_reward_weight,
         diversity_reward_weight=diversity_reward_weight,
         benign_sparsity_penalty_weight=benign_sparsity_penalty_weight,
+        bbox_area_penalty_weight=args.get('rl_bbox_area_penalty_weight', 0.0),
+        bbox_target_area_fraction=args.get('rl_bbox_target_area_fraction', 0.25),
+        sensitivity_pos_weight=sensitivity_pos_weight,
+        sensitivity_high_inv_threshold=sensitivity_high_inv_threshold,
+        sensitivity_high_inv_extra_weight=sensitivity_high_inv_extra_weight,
+        sensitivity_cspca_extra_weight=sensitivity_cspca_extra_weight,
+        sensitivity_fn_prob_margin=sensitivity_fn_prob_margin,
+        sensitivity_fn_penalty_weight=sensitivity_fn_penalty_weight,
+        sensitivity_negative_weight=sensitivity_negative_weight,
     )
+

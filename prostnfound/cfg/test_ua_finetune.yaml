@@ -1,0 +1,82 @@
+# Evaluation config for UA finetuned models on the held-out test split.
+#
+# This evaluates models on the test patients that were NEVER seen during
+# finetuning (defined by splits/ua_finetune_splits.json).
+#
+# Run from the prostnfound/ directory:
+#   python test_ua_models.py --config cfg/test_ua_finetune.yaml
+
+python: python
+test_script: test_rl.py
+base_output_dir: outputs/ua_finetune_eval
+split: test               # uses the "test" key from splits/ua_finetune_splits.json
+fail_fast: false
+require_nonempty_optimum_root: true
+
+data:
+  dataset: optimum
+  cohort_selection_mode: splits_file
+  splits_file: splits/ua_finetune_splits.json   # same file used during training
+  root_dir: /data/project/prostate-us/processed/processed/processed/UA_annotated_needles
+  batch_size: 8
+  num_workers: 8
+  augmentations: translate
+  image_size: 256
+  first_downsample_size: null
+  mask_size: 64
+  mean: [0, 0, 0]
+  std: [1, 1, 1]
+  flip_ud: false
+  frames: first
+  crop_to_prostate: false
+  rf_as_bmode: false
+  include_rf: false
+  train_subsample_seed: 42
+
+common_overrides:
+  - postprocess=true
+  - include_patient_metrics=true
+  - save_raw_heatmaps=false
+  - save_rendered_heatmaps=true
+  - save_format=png
+  - use_amp=false
+  - torch_compile=false
+  - apply_prostate_mask_to_decoder=true
+  - boundary_tolerance_patches=1
+
+models:
+  # # ── PPO-supervised-baseline: zero-shot ─────────────────────────────────────
+  # - name: PPO-supervised-baseline-zeroshot
+  #   enabled: true
+  #   checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_rl_v3/PPO-supervised-baseline/best_rl.pth
+  #   output_subdir: PPO-supervised-baseline-zeroshot
+  #   overrides: []
+
+  # # ── PPO-supervised-baseline: UA-finetuned ──────────────────────────────────
+  # - name: UA-supervised-finetune-ppo-baseline
+  #   enabled: true
+  #   checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_ua_finetune/UA-supervised-finetune-ppo-baseline/best_rl.pth
+  #   output_subdir: UA-supervised-finetune-ppo-baseline
+  #   overrides: []
+
+  # ── pnf+: zero-shot ────────────────────────────────────────────────────────
+  - name: pnf-plus-zeroshot
+    enabled: true
+    checkpoint: /home/sinanmz/prostate/Prostnfound-RL/prostnfound/checkpoints_with_prompts_baseline/best.pth
+    output_subdir: pnf-plus-zeroshot
+    model: prostnfound_adapter_medsam_legacy
+    model_kw:
+      prompts: [age, psa, psad, pos]
+      use_class_decoder: true
+    overrides: []
+
+  # ── pnf+: UA-finetuned ─────────────────────────────────────────────────────
+  - name: UA-supervised-finetune-pnf-plus
+    enabled: true
+    checkpoint: /home/mahdi.abootorabi/prostnfound/prostnfound/checkpoints_ua_finetune/UA-supervised-finetune-pnf-plus/best_rl.pth
+    output_subdir: UA-supervised-finetune-pnf-plus
+    model: prostnfound_adapter_medsam_legacy
+    model_kw:
+      prompts: [age, psa, psad, pos]
+      use_class_decoder: true
+    overrides: []

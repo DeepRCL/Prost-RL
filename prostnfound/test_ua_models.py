@@ -21,14 +21,24 @@ from omegaconf import DictConfig, OmegaConf
 
 
 def _to_hydra_value(value: Any) -> str:
+    """Serialize a Python value to a Hydra override string.
+
+    Hydra's override grammar requires its own syntax for lists and dicts —
+    NOT standard JSON.  In particular, dict keys must be unquoted:
+        valid:   model_kw={prompts:[age,psa],use_class_decoder:true}
+        invalid: model_kw={"prompts":["age","psa"],"use_class_decoder":true}
+    """
     if value is None:
         return "null"
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return str(value)
-    if isinstance(value, (list, dict)):
-        return json.dumps(value, separators=(",", ":"))
+    if isinstance(value, list):
+        return "[" + ",".join(_to_hydra_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        pairs = ",".join(f"{k}:{_to_hydra_value(v)}" for k, v in value.items())
+        return "{" + pairs + "}"
     return str(value)
 
 

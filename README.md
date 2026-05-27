@@ -1,164 +1,145 @@
-# ProstNFound-RL: Reinforcement Learning-Guided Attention for Prostate Cancer Detection
+# Prost-RL
 
-ProstNFound-RL extends the **ProstNFound+** ultrasound-based prostate cancer detection model by adding an **RL-guided attention mechanism**. Instead of passively processing the whole image, an RL agent learns *where* the model should look—focusing on suspicious regions that improve both heatmap generation and cancer classification.
+Official implementation of **Prost-RL**: a reinforcement-learning framework for robust micro-ultrasound prostate cancer detection, built on the [ProstNFound+](https://github.com/DeepRCL/ProstNFound) backbone (MedSAM encoder–decoder with clinical prompts).
 
-This idea is inspired by how radiologists actively search for abnormalities rather than scanning every pixel equally.
-<img width="1113" height="389" alt="image" src="https://github.com/user-attachments/assets/db841453-8615-45f7-8b1c-fc810c44bf06" />
+**Paper:** *Learning Where to Look: A Reinforcement Learning Framework for Robust Micro-Ultrasound Prostate Cancer Detection*
 
----
+## Overview
 
-## 🚀 What This Project Does
+Prost-RL adds three components on top of ProstNFound+:
 
-* Uses the **MedSAM encoder** from ProstNFound+ to extract image features.
-* Trains an **RL policy network** to identify a small set of informative regions in the ultrasound image.
-* Passes these regions as **attention prompts** to the decoder, alongside clinical metadata (Age, PSA).
-* Optimizes the policy using **GRPO** or **PPO**—both tested and compared in this project.
-* Improves sensitivity, heatmap quality, and interpretability by explicitly guiding the model’s focus.
+1. **Spatial attention policy** — learns where to attend before decoding.
+2. **Noise-robust supervision** — symmetric cross-entropy plus pixel entropy regularization for weak core-level labels.
+3. **Adaptive Policy Optimization (APO)** — DRPO fine-tuning with a pairwise ranking reward after supervised warm-up.
 
----
+## Repository layout
 
-## 🧠 Why Reinforcement Learning?
+```
+medAI/              # Models, datasets, MedSAM adapters, DRPO
+external_libs/      # Additional dependencies (editable install)
+prostnfound/        # Training and evaluation scripts (Hydra configs)
+environment.yml     # Conda environment
+requirements.txt    # Pip dependencies
+```
 
-Ultrasound labels are weak: we only know the cancer involvement of the biopsy core, not pixel-level annotations. RL lets the model *discover* helpful attention strategies by trial and error.
+## Setup
 
-* Rewards are based on **outcomes**: Did selecting these regions improve classification or ROI estimation?
-* GRPO and PPO allow us to compare multiple attention configurations per image.
-* The agent gradually learns to highlight meaningful structures rather than arbitrary regions.
+### Environment
 
-This approach is particularly useful when supervision is limited, noisy, or indirect—exactly the case in prostate ultrasound.
-
----
-
-## 🏗 High-Level Architecture
-
-1. **MedSAM encoder** → produces feature map
-2. **RL policy network** → selects k suspicious locations
-3. **Prompt encoder** → turns coordinates into spatial prompts
-4. **Mask + Class decoders** → generate heatmap + csPCa likelihood
-5. **Reward module** → evaluates how helpful the chosen regions were
-6. **GRPO/PPO** → updates the policy
-
-This creates a compact, interpretable attention mechanism between encoder and decoder.
-
----
-
-## 📊 Key Findings (From Experiments)
-
-Our experiments (on NCT2013 data) show that ProstNFound-RL consistently improves or matches the baseline ProstNFound+ model across most metrics:
-
-* Higher **Core AUROC**
-* Higher **csPCa Heatmap AUROC**
-* Better **Sensitivity at fixed specificity levels**
-* Improved spatial interpretability through meaningful attention points
-
-Among all tested variants:
-
-* **PPO + No Mask + Loss-based reward** gave the strongest results.
-* Surprisingly, allowing the agent to explore *outside* the prostate sometimes helped—likely due to contextual cues in surrounding tissue.
-* The combined reward (classification + ROI) improved interpretability and heatmap quality.
-
-Full details and metrics appear in the report.
-
----
-
-## 🧪 Challenges
-
-Training this hybrid RL + multi-task system is computationally heavy and sometimes unstable:
-
-* Occasional **loss divergence** after several epochs
-* Attention drifting outside the prostate
-* Decoder initially ignoring RL prompts
-* Large hyperparameter search space
-
-We implemented solutions such as reward shaping, prostate-boundary constraints, and visualization tools to track attention behavior.
-
----
-
-## 🔧 Getting Started
-
-### Installation
-
-#### Prerequisites
-
-- Python 3.8+
-- CUDA 11.0+ (for GPU training)
-- 16GB+ GPU memory (RTX 3090, A100, etc.)
+From the repository root:
 
 ```bash
-git clone https://github.com/aboots/Prostnfound-RL
-cd Prostnfound-RL
 conda env create -f environment.yml
 conda activate prostnfound
 ```
-- Install all Python dependencies
-```pip install -r requirements.txt```
 
-- Install local packages in editable mode
-```bash
-pip install -e medAI
-pip install -e external_libs
-```
-
-- Download MedSAM checkpoint
-```mkdir -p checkpoints
-wget -O checkpoints/medsam_vit_b_cpu.pth "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-# Note: You may need to obtain the actual MedSAM weights from the original authors
-```
-
-### Train with RL
+Or install editable packages manually:
 
 ```bash
-python train_rl.py -c cfg/train/pnf_plus_rl_kfold.yaml
+pip install -r requirements.txt
+pip install -e ./medAI -e ./external_libs
 ```
 
-### Evaluate
+### Data and checkpoints
+
+The NCT2013 micro-ultrasound cohort is accessed via `EXACTVU_PCA_DATA_ROOT` (must contain an `nct2013/` subdirectory with images, masks, and metadata). See [ClinicalTrials.gov NCT02079025](https://clinicaltrials.gov/study/NCT02079025) for the prospective trial this cohort derives from.
+
+Download [MedSAM](https://github.com/bowang-lab/MedSAM) weights and set:
 
 ```bash
-python test_rl.py -c cfg/test_rl.yaml model_checkpoint=path/to/checkpoint.pth
+export EXACTVU_PCA_DATA_ROOT=/path/to/exactvu_pca_data
+export MEDSAM_CHECKPOINT_DIR=/path/to/medsam_checkpoints
+export CHECKPOINT_DIR=/path/to/checkpoints   # optional; used by some medAI utilities
 ```
 
----
+## Training (EXP4 — best model)
 
-## 🗂 Project Structure
+Training is two-stage per fold: **supervised warm-up**, then **DRPO / pairwise-ranking RL** initialized from that checkpoint.
 
-```
-medAI/
-   modeling/
-      prostnfound_rl.py       # RL-extended model
-      rl_attention_policy.py  # Policy network
-      grpo.py                 # GRPO implementation
-prostnfound/
-   train_rl.py                # Training script
-   test_rl.py                 # Evaluation
-   cfg/                       # YAML configs
+Run from `prostnfound/`:
+
+```bash
+cd prostnfound
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$(pwd)"
 ```
 
-### Key Training Hyperparameters
+### Stage 1 — supervised warm-up (35 epochs, batch size 8)
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `rl_num_samples_per_image` | 4-8 | Rollouts per image for within-image comparison |
-| `rl_num_update_epochs` | 4 | GRPO updates per batch |
-| `rl_clip_eps` | 0.2 | PPO clipping epsilon |
-| `rl_entropy_coef` | 0.01 | Exploration bonus |
-| `rl_kl_coef` | 0.01 | KL penalty coefficient |
-| `rl_cspca_bonus` | 1.5-2.0 | Reward multiplier for csPCa |
-| `num_attention_points` | 3-5 | Number of attention points |
-| `policy_hidden_dim` | 512 | Policy network hidden dimension |
+| Fold | Config |
+|------|--------|
+| 0 | `cfg/train/experiments/ppo/supervised_baseline.yaml` |
+| 1–4 | `cfg/train/experiments/ppo/cross_fold/supervised_baseline_fold{N}.yaml` |
 
----
+```bash
+# Example: fold 0
+python train_rl.py --config cfg/train/experiments/ppo/supervised_baseline.yaml
 
-## 📄 Citation
+# Example: fold 2
+python train_rl.py --config cfg/train/experiments/ppo/cross_fold/supervised_baseline_fold2.yaml
+```
 
-If you use this work, please cite the project report (placeholder):
+Checkpoints are written under `checkpoints_supervised_cv/PPO-supervised-baseline-fold{N}/best_rl.pth`.
+
+### Stage 2 — Prost-RL / EXP4 (35 epochs, batch size 16, DRPO)
+
+| Fold | Config |
+|------|--------|
+| 0 | `cfg/train/experiments/v3/exp4_pairwise_ranking_rl.yaml` |
+| 1–4 | `cfg/train/experiments/v3_cross_fold/exp4_pairwise_ranking_rl_fold{N}.yaml` |
+
+```bash
+# Example: fold 0 (loads ../checkpoints_supervised_cv/PPO-supervised-baseline-fold0/best_rl.pth)
+python train_rl.py --config cfg/train/experiments/v3/exp4_pairwise_ranking_rl.yaml
+
+# Example: fold 3
+python train_rl.py --config cfg/train/experiments/v3_cross_fold/exp4_pairwise_ranking_rl_fold3.yaml
+```
+
+Outputs are saved to `checkpoints_supervised_cv/EXP4-pairwise-ranking-rl-fold{N}/` (fold 0 run name may include a `-v2` suffix in the config).
+
+### Key hyperparameters (EXP4)
+
+| Setting | Value |
+|---------|-------|
+| Loss | `symmetric_ce_entropy_reg` (α=β=1, ε=1e-4) |
+| RL algorithm | DRPO |
+| Reward | `pairwise_ranking` (csPCa bonus γ=2) |
+| Rollouts K | 4 |
+| Attention noise σ | 0.15 |
+| RL loss weight | 0.8 |
+| Optimizer | AdamW, lr=2e-5, encoder lr=1e-5, wd=1e-3 |
+| Model selection | `val/core_auc_high_involvement` |
+
+## Evaluation
+
+```bash
+cd prostnfound
+
+python test_rl.py \
+  checkpoint=/path/to/checkpoints_supervised_cv/EXP4-pairwise-ranking-rl-fold0/best_rl.pth \
+  output_dir=outputs/exp4_fold0 \
+  data.fold=0 \
+  split=val
+```
+
+Repeat for folds 1–4 with the matching checkpoint and `data.fold`. Optional: set `PNF_RL_CHECKPOINT` instead of the `checkpoint=` override.
+
+## Citation
+
+If you use this code, please cite our paper (MICCAI 2025 submission) and the ProstNFound+ baseline:
 
 ```bibtex
-coming soon !
+@inproceedings{abootorabi2025prostrl,
+  title={Learning Where to Look: A Reinforcement Learning Framework for Robust Micro-Ultrasound Prostate Cancer Detection},
+  author={Abootorabi, Mohammad Mahdi and Namazi, Sina and Saadat, Armin and Wang, Lyuyang and Dzikunu, Obed and Wilson, Paul F. R. and Guo, Zhuoxin and Wodlinger, Brian and Mousavi, Parvin and Abolmaesumi, Purang},
+  year={2025}
+}
 ```
 
----
+## License
 
-## 📬 Contact
+Research code released for reproducibility. Dataset access is subject to the NCT2013 trial data use agreement; contact the authors for data sharing questions.
 
-**Mohammad Mahdi Abootorabi**
-[mahdi.abootorabi@ece.ubc.ca](mailto:mahdi.abootorabi@ece.ubc.ca)
+## Acknowledgments
+
+Built on [ProstNFound+](https://github.com/DeepRCL/ProstNFound), [MedSAM](https://github.com/bowang-lab/MedSAM), and the `medAI` training stack used in the ProstNFound line of work.

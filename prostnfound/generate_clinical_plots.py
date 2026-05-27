@@ -93,9 +93,12 @@ def _sens_at_spec(y, s, spec_target):
     if len(np.unique(y)) < 2: return np.nan
     fpr, tpr, _ = roc_curve(y, s)
     spec = 1.0 - fpr
-    idx = np.searchsorted(-spec, -spec_target)
-    idx = int(np.clip(idx, 0, len(tpr)-1))
-    return float(tpr[idx])
+    # Use the best achievable sensitivity while satisfying specificity >= target.
+    valid = spec >= spec_target
+    if np.any(valid):
+        return float(np.max(tpr[valid]))
+    # Fallback (should be rare): return sensitivity at maximum specificity point.
+    return float(tpr[np.argmax(spec)])
 
 def _opt_threshold(y, s, metric="balanced_accuracy"):
     threshs = np.linspace(0.01, 0.99, 99)
@@ -157,7 +160,6 @@ def plot_roc(data, score_col, head_label, subgroup, out_dir, fname):
     ax.axhspan(0.7, 1.02, color="#d4e6f1", alpha=0.12, zorder=0)
     ax.set_xlabel("1 − Specificity (FPR)", fontsize=11)
     ax.set_ylabel("Sensitivity (TPR)", fontsize=11)
-    ax.set_title(f"ROC — {GRPLABEL[subgroup]}\n{head_label}", fontsize=11, fontweight="bold")
     ax.legend(fontsize=8, loc="lower right", framealpha=0.88)
     ax.set_xlim(0,1); ax.set_ylim(0,1.02)
     ax.grid(True, alpha=0.2)
@@ -189,8 +191,6 @@ def plot_sensitivity_bars(data, score_col, head_label, subgroup, out_dir, fname)
     ax.set_xticks(x)
     ax.set_xticklabels([f"{int(s*100)}%" for s in SPEC_TARGETS], fontsize=10)
     ax.set_xlabel("Specificity", fontsize=11); ax.set_ylabel("Sensitivity", fontsize=11)
-    ax.set_title(f"Sensitivity @ Specificity — {GRPLABEL[subgroup]}\n{head_label}",
-                 fontsize=11, fontweight="bold")
     ax.set_ylim(0, 1.15)
     ax.axhline(0.8, color="gray", ls="--", lw=0.8, alpha=0.5)
     ax.legend(fontsize=8, framealpha=0.88)
@@ -215,11 +215,8 @@ def plot_auroc_vs_threshold(data, score_col, head_label, subgroup, variant_label
     fig, ax = plt.subplots(figsize=(7, 5))
     for i, (name, df) in enumerate(data.items()):
         if score_col not in df.columns: continue
-        # Optionally restrict to csPCa subset (keep benign too)
-        if subgroup == "cspca":
-            sub = df[df["cspca_mask"]].copy()
-        else:
-            sub = df.copy()
+        # Respect subgroup masks consistently (including benign negatives where defined).
+        sub = _subgroup(df, subgroup).copy()
         sub = sub.dropna(subset=[score_col])
         scores   = sub[score_col].values
         involv   = sub["involvement"].values
@@ -233,10 +230,8 @@ def plot_auroc_vs_threshold(data, score_col, head_label, subgroup, variant_label
         if xs:
             ax.plot(xs, aucs, color=_c(i), ls=_s(i), lw=2.2,
                     marker=_m(i), markersize=7, label=name)
-    ax.set_xlabel("Minimum Involvement Threshold (%)", fontsize=11)
+    ax.set_xlabel("Involvement Threshold (%)", fontsize=11)
     ax.set_ylabel("AUROC (%)", fontsize=11)
-    ax.set_title(f"AUROC vs Involvement Threshold\n{GRPLABEL[subgroup]} — {head_label} ({variant_label})",
-                 fontsize=10, fontweight="bold")
     ax.legend(fontsize=8, framealpha=0.88, loc="lower right")
     ax.set_xlim(-2, max(INV_THRESH_PCT)+3); ax.set_ylim(None, None)
     ax.grid(True, alpha=0.25, ls="--")
@@ -270,8 +265,6 @@ def plot_prediction_vs_involvement(data, score_col, head_label, variant_label, o
     ax.text(41, 0.02, "High-Inv ↑", fontsize=8, color="gray")
     ax.set_xlabel("True Involvement (%)", fontsize=11)
     ax.set_ylabel("Mean Predicted Score ± SEM", fontsize=11)
-    ax.set_title(f"Prediction vs Involvement — {head_label} ({variant_label})",
-                 fontsize=11, fontweight="bold")
     ax.set_xlim(-2, 102); ax.set_ylim(-0.05, 1.05)
     ax.legend(fontsize=8, framealpha=0.88)
     ax.grid(True, alpha=0.22)
@@ -308,8 +301,6 @@ def plot_score_distributions(data, score_col, head_label, subgroup, out_dir, fna
     ax.legend(handles=legend_el, fontsize=9, loc="upper left")
     ax.set_xlim(-1, n*3); ax.set_ylim(-0.1, 1.05)
     ax.set_xticks([]); ax.set_ylabel("Predicted Score", fontsize=11)
-    ax.set_title(f"Score Distributions — {GRPLABEL[subgroup]}\n{head_label}",
-                 fontsize=11, fontweight="bold")
     ax.grid(True, axis="y", alpha=0.22)
     plt.tight_layout()
     save(fig, out_dir, fname)
@@ -359,8 +350,6 @@ def plot_error_by_involvement(data, score_col, head_label, subgroup, variant_lab
                     ha="center", va="top", fontsize=7, color="gray")
     ax.set_xlabel("True Involvement Range", fontsize=11)
     ax.set_ylabel("MAE (|Pred − Involvement|)", fontsize=11)
-    ax.set_title(f"Error by Involvement — {GRPLABEL[subgroup]}\n{head_label} ({variant_label})",
-                 fontsize=11, fontweight="bold")
     ax.legend(fontsize=8, framealpha=0.88)
     ax.grid(True, axis="y", alpha=0.22)
     plt.tight_layout()
@@ -451,10 +440,6 @@ def plot_accuracy_by_involvement(data, score_col, subgroup, out_dir, fname,
     suffix = f" [{thresh_legend}]"
     ax.set_xlabel("True Involvement Range", fontsize=11)
     ax.set_ylabel(f"{metric_name} (%)", fontsize=11)
-    ax.set_title(f"{metric_name} by Involvement \u2014 {GRPLABEL[subgroup]}\n"
-                 f"Classification Head{suffix}\n"
-                 "(bins \u226520%: cancer-only \u2192 value = sensitivity at that level)",
-                 fontsize=10, fontweight="bold")
     ax.set_ylim(0, 115)
     ax.legend(fontsize=8, framealpha=0.88)
     ax.grid(True, axis="y", alpha=0.22)
@@ -489,7 +474,6 @@ def plot_threshold_analysis(data, score_col, out_dir, fname):
     ]:
         ax.set_xlabel("Classification Threshold", fontsize=11)
         ax.set_ylabel(ylabel, fontsize=11)
-        ax.set_title(title, fontsize=11, fontweight="bold")
         ax.legend(fontsize=8, framealpha=0.88)
         ax.set_xlim(0,1); ax.set_ylim(0,1)
         ax.grid(True, alpha=0.22)
@@ -547,7 +531,7 @@ def plot_involvement_scatter(data, score_col, head_label, out_dir, fname):
                      Line2D([0],[0],marker="o",color="gray",ms=5,alpha=0.6,label="Correct"),
                      Line2D([0],[0],marker="x",color="gray",ms=7,lw=1.5,label="Wrong")]
         ax.legend(handles=legend_el, fontsize=7, framealpha=0.85, loc="upper left")
-    fig.suptitle(f"Per-Sample: Involvement vs Score — {head_label}", fontsize=12, fontweight="bold")
+
     plt.tight_layout()
     save(fig, out_dir, fname)
 
@@ -585,8 +569,6 @@ def plot_patient_roc(data, score_col, head_label, out_dir, fname, agg="max"):
                     markevery=0.2, ms=5, label=f"{name} (AUC={auc:.3f})")
         ax.plot([0,1],[0,1],"k--",lw=0.8,alpha=0.4)
         ax.set_xlabel("1 − Specificity"); ax.set_ylabel("Sensitivity")
-        ax.set_title(f"Patient-Level ROC — {title}\n{head_label} ({agg} score)",
-                     fontsize=10, fontweight="bold")
         ax.legend(fontsize=8, loc="lower right", framealpha=0.88)
         ax.set_xlim(0,1); ax.set_ylim(0,1.02)
         ax.grid(True, alpha=0.2)
@@ -617,7 +599,6 @@ def plot_patient_score_distribution(data, score_col, head_label, out_dir, fname)
     ax.legend(handles=legend_el, fontsize=9, loc="upper left")
     ax.set_xlim(-1, n*3); ax.set_ylim(-0.1, 1.05)
     ax.set_xticks([]); ax.set_ylabel("Max Core Score per Patient", fontsize=11)
-    ax.set_title(f"Patient-Level Score Distribution\n{head_label}", fontsize=11, fontweight="bold")
     ax.grid(True, axis="y", alpha=0.22)
     plt.tight_layout()
     save(fig, out_dir, fname)
@@ -644,12 +625,391 @@ def plot_patient_sensitivity_bars(data, score_col, head_label, out_dir, fname):
                             ha="center", va="bottom", fontsize=6, color=_c(i), fontweight="bold")
         ax.set_xticks(x); ax.set_xticklabels([f"{int(s*100)}%" for s in SPEC_TARGETS], fontsize=9)
         ax.set_xlabel("Specificity"); ax.set_ylabel("Sensitivity")
-        ax.set_title(f"Patient Sensitivity @ Specificity\n{title} — {head_label}",
-                     fontsize=10, fontweight="bold")
         ax.set_ylim(0,1.15); ax.axhline(0.8,color="gray",ls="--",lw=0.8,alpha=0.5)
         ax.legend(fontsize=8,framealpha=0.88); ax.grid(True,axis="y",alpha=0.22)
     plt.tight_layout()
     save(fig, out_dir, fname)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Patient-level: balanced-accuracy-focused plots
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_bal_acc(y, yp):
+    if len(y) == 0 or len(np.unique(y)) < 2:
+        return np.nan
+    return balanced_accuracy_score(y, yp)
+
+
+def plot_patient_balanced_accuracy_curve(
+    data, score_col, head_label, out_dir, fname, agg="max"
+):
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    threshs = np.linspace(0.01, 0.99, 99)
+
+    for i, (name, df) in enumerate(data.items()):
+        if score_col not in df.columns:
+            continue
+        pat = _patient_agg(df, score_col).dropna(subset=["label"])
+        score_key = "max_score" if agg == "max" else "mean_score"
+        pat = pat.dropna(subset=[score_key])
+        if len(np.unique(pat["label"].values)) < 2:
+            continue
+
+        y = pat["label"].values.astype(int)
+        s = pat[score_key].values.astype(float)
+        bas = np.array([_safe_bal_acc(y, (s >= t).astype(int)) for t in threshs])
+        if np.all(np.isnan(bas)):
+            continue
+        best_idx = int(np.nanargmax(bas))
+        ax.plot(
+            threshs,
+            bas * 100,
+            color=_c(i),
+            ls=_s(i),
+            lw=2.1,
+            label=f"{name} (best={bas[best_idx]*100:.1f}% @ t={threshs[best_idx]:.2f})",
+        )
+        ax.scatter(
+            [threshs[best_idx]],
+            [bas[best_idx] * 100],
+            color=_c(i),
+            marker="*",
+            s=120,
+            edgecolor="k",
+            linewidth=0.8,
+            zorder=5,
+        )
+
+    ax.set_xlabel("Decision Threshold", fontsize=11)
+    ax.set_ylabel("Balanced Accuracy (%)", fontsize=11)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 100)
+    ax.grid(True, alpha=0.22)
+    ax.legend(fontsize=8, framealpha=0.88, loc="best")
+    plt.tight_layout()
+    save(fig, out_dir, fname)
+
+
+def plot_patient_balanced_accuracy_summary(
+    data, score_col, head_label, out_dir, fname, agg="max"
+):
+    labels = []
+    best_bas = []
+    best_t = []
+    yerrs = []
+
+    for name, df in data.items():
+        if score_col not in df.columns:
+            continue
+        pat = _patient_agg(df, score_col).dropna(subset=["label"])
+        score_key = "max_score" if agg == "max" else "mean_score"
+        pat = pat.dropna(subset=[score_key])
+        if len(np.unique(pat["label"].values)) < 2:
+            continue
+
+        y = pat["label"].values.astype(int)
+        s = pat[score_key].values.astype(float)
+        threshs = np.linspace(0.01, 0.99, 99)
+        bas = np.array([_safe_bal_acc(y, (s >= t).astype(int)) for t in threshs])
+        if np.all(np.isnan(bas)):
+            continue
+
+        idx = int(np.nanargmax(bas))
+        t = float(threshs[idx])
+        yp = (s >= t).astype(int)
+        sens = recall_score(y, yp, zero_division=0)
+        spec = recall_score(y, yp, pos_label=0, zero_division=0)
+
+        labels.append(name)
+        best_bas.append(float(bas[idx] * 100))
+        best_t.append(t)
+        yerrs.append(abs(sens - spec) * 50.0)
+
+    if not labels:
+        return
+
+    x = np.arange(len(labels))
+    fig, ax = plt.subplots(figsize=(max(8.5, len(labels) * 1.8), 5.2))
+    bars = ax.bar(
+        x,
+        best_bas,
+        yerr=yerrs,
+        capsize=3,
+        color=[_c(i) for i in range(len(labels))],
+        alpha=0.88,
+        edgecolor="white",
+        linewidth=0.8,
+    )
+    for i, (b, ba, t) in enumerate(zip(bars, best_bas, best_t)):
+        ax.text(
+            b.get_x() + b.get_width() / 2,
+            ba + 1.2,
+            f"{ba:.1f}%\nt={t:.2f}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color=_c(i),
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_ylabel("Balanced Accuracy at Optimal Threshold (%)", fontsize=11)
+    ax.set_xlabel("Model", fontsize=11)
+    ax.set_ylim(0, 100)
+    ax.grid(True, axis="y", alpha=0.22)
+    ax.axhline(50, color="gray", ls="--", lw=0.9, alpha=0.5)
+    plt.tight_layout()
+    save(fig, out_dir, fname)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-patient checkerboard-style map (model score + biopsy result)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _core_status_from_grade_group(gg):
+    if pd.isna(gg):
+        return 0
+    gg = float(gg)
+    if gg <= 0:
+        return 0  # Benign / no cancer
+    if gg < 3:
+        return 1  # isPCa
+    return 2      # csPCa
+
+
+def _summarize_patients_for_selection(df):
+    needed = {"patient_id", "grade_group", "involvement", "core_id"}
+    if any(c not in df.columns for c in needed):
+        return pd.DataFrame(columns=["patient_id", "status", "max_involvement", "n_cores"])
+    g = (
+        df.dropna(subset=["patient_id"])
+        .groupby("patient_id", dropna=True)
+        .agg(
+            max_grade_group=("grade_group", "max"),
+            max_involvement=("involvement", "max"),
+            n_cores=("core_id", "nunique"),
+        )
+        .reset_index()
+    )
+    g["status"] = g["max_grade_group"].apply(_core_status_from_grade_group)
+    return g[["patient_id", "status", "max_involvement", "n_cores"]]
+
+
+def _select_shared_patients_across_models(data, n_patients_per_group=8):
+    """
+    Build one consistent patient list per status across all models.
+    Selection strategy:
+      1) patient must exist in ALL models
+      2) patient status must be identical in ALL models
+      3) rank by highest mean max-involvement across models (descending)
+    """
+    summaries = {}
+    for name, df in data.items():
+        s = _summarize_patients_for_selection(df)
+        if len(s) == 0:
+            continue
+        summaries[name] = s.set_index("patient_id")
+    if not summaries:
+        return {0: [], 1: [], 2: []}
+
+    # Intersection of patients present in all models
+    common_ids = set(next(iter(summaries.values())).index)
+    for s in summaries.values():
+        common_ids &= set(s.index)
+    common_ids = sorted(common_ids)
+    if not common_ids:
+        return {0: [], 1: [], 2: []}
+
+    selected = {0: [], 1: [], 2: []}
+    for status_id in [0, 1, 2]:
+        rows = []
+        for pid in common_ids:
+            statuses = [int(s.loc[pid, "status"]) for s in summaries.values()]
+            if any(st != status_id for st in statuses):
+                continue
+            mean_inv = float(np.mean([float(s.loc[pid, "max_involvement"]) for s in summaries.values()]))
+            mean_n = float(np.mean([float(s.loc[pid, "n_cores"]) for s in summaries.values()]))
+            rows.append((pid, mean_inv, mean_n))
+        rows.sort(key=lambda x: (x[1], x[2], str(x[0])), reverse=True)
+        selected[status_id] = [pid for pid, _, _ in rows[:n_patients_per_group]]
+    return selected
+
+
+def _plot_patient_checkerboard_single_model(
+    df,
+    score_col,
+    model_name,
+    head_label,
+    out_dir,
+    fname,
+    selected_patients_by_status,
+    max_cores=18,
+):
+    if score_col not in df.columns:
+        return
+    needed_cols = {"patient_id", "core_id", "grade_group", score_col, "PRI-MUS", "PI-RADS"}
+    if any(c not in df.columns for c in needed_cols):
+        return
+
+    fig, axes = plt.subplots(1, 3, figsize=(9, 0.13 * 40), sharey=False)
+    status_titles = ["No Cancer", "isPCa", "csPCa"]
+    risk_colors = ["#b2df8a", "#ffffbf", "#fdae61", "#f46d43", "#d73027"]
+    cmap = matplotlib.colors.ListedColormap(risk_colors, name="risk_cmap")
+    bounds = [0.5, 1.5, 2.5, 3.5, 4.5, 5.5]
+    norm = matplotlib.colors.BoundaryNorm(bounds, cmap.N)
+    rgba_gray = matplotlib.colors.to_rgba("gray", 0.25)
+
+    def _score_to_bin_linear(values):
+        v = np.asarray(values, dtype=float)
+        if len(v) == 0:
+            return np.array([], dtype=float)
+        v = np.clip(v, 0.0, 1.0)
+        return np.clip(np.floor(v * 5).astype(int) + 1, 1, 5).astype(float)
+
+    def _fit_primus_matched_bin_edges(df_all, score_column):
+        """
+        Notebook-style binning: match score-bin proportions to PRI-MUS distribution.
+        Returns 5 monotonic upper edges (q1..q5), or None if unavailable.
+        """
+        if "PRI-MUS" not in df_all.columns or score_column not in df_all.columns:
+            return None
+
+        fit_df = df_all.dropna(subset=["PRI-MUS", score_column]).copy()
+        if len(fit_df) < 10:
+            return None
+
+        primus = fit_df["PRI-MUS"].astype(float).values
+        scores = fit_df[score_column].astype(float).values
+        if len(scores) == 0:
+            return None
+
+        counts = (
+            pd.Series(primus)
+            .value_counts(normalize=True)
+            .reindex([1, 2, 3, 4, 5], fill_value=0.0)
+        )
+        if float(counts.sum()) <= 0:
+            return None
+
+        cum_probs = np.cumsum(counts.values)
+        cum_probs = np.clip(cum_probs, 0.0, 1.0)
+        edges = np.quantile(scores, cum_probs)
+        edges = np.maximum.accumulate(edges.astype(float))
+        return edges
+
+    def _score_to_bin_primus_matched(values, edges):
+        """
+        Map continuous scores to bins 1..5 using upper edges q1..q5.
+        """
+        v = np.asarray(values, dtype=float)
+        if len(v) == 0:
+            return np.array([], dtype=float)
+        if edges is None:
+            return _score_to_bin_linear(v)
+
+        bins = np.searchsorted(edges, v, side="left") + 1
+        bins = np.clip(bins, 1, 5)
+        return bins.astype(float)
+
+    primus_matched_edges = _fit_primus_matched_bin_edges(df, score_col)
+
+    def _gg_to_risk_bin(gg):
+        if pd.isna(gg):
+            return np.nan
+        gg = float(gg)
+        if gg == 0:
+            return 1
+        if gg < 3:
+            return 3
+        return 5
+
+    for status_id, ax in enumerate(axes):
+        pats = selected_patients_by_status.get(status_id, [])
+        n_rows = max(1, 4 * len(pats))
+        mat = np.full((n_rows, max_cores), np.nan, dtype=float)
+        row_labels = []
+
+        for i, pid in enumerate(pats):
+            sub = df[df["patient_id"] == pid].copy()
+            sub = sub.dropna(subset=[score_col, "grade_group", "PRI-MUS", "PI-RADS"])
+            sub = sub.sort_values("core_id").head(max_cores)
+            if len(sub) == 0:
+                row_labels.extend([""] * 4)
+                continue
+
+            model_scores = _score_to_bin_primus_matched(
+                sub[score_col].astype(float).values,
+                primus_matched_edges,
+            )
+            human_scores = sub["PRI-MUS"].astype(float).values
+            pi_rads = sub["PI-RADS"].astype(float).values
+            gt_scores = sub["grade_group"].apply(_gg_to_risk_bin).astype(float).values
+
+            mat[i * 4, : len(model_scores)] = model_scores
+            mat[i * 4 + 1, : len(human_scores)] = human_scores
+            mat[i * 4 + 2, : len(pi_rads)] = pi_rads
+            mat[i * 4 + 3, : len(gt_scores)] = gt_scores
+
+            if i == 0 and status_id == 0:
+                row_labels.extend(["Model", "PRI-MUS", "PI-RADS", "Path. GT"])
+            else:
+                row_labels.append(str(pid))
+                row_labels.extend([""] * 3)
+
+        if len(pats) == 0:
+            row_labels = [""]
+
+        ax.imshow(
+            mat,
+            aspect="auto",
+            interpolation="nearest",
+            cmap=cmap,
+            norm=norm,
+            vmin=1,
+            vmax=5,
+        )
+
+        rows = mat.shape[0]
+        for y in range(0, rows + 4, 4):
+            ax.axhline(y - 0.5, color="black", lw=4)
+        for y in range(3, rows + 4, 4):
+            ax.axhline(y + 0.5, color="black", lw=1.5, ls="--")
+
+        for x in range(0, max_cores + 1):
+            ax.axvline(x - 0.5, color=rgba_gray, lw=0.5)
+
+        ax.set_title(status_titles[status_id], fontsize=11, fontweight="bold")
+        ax.set_xlim(-0.5, max_cores - 0.5)
+        ax.set_xticks([])
+        ax.set_yticks(np.arange(len(row_labels)) + 0.5)
+        ax.set_yticklabels(row_labels, fontsize=9, rotation=0)
+        ax.tick_params(axis="y", length=0)
+
+    fig.suptitle(f"{head_label} — {model_name}", fontsize=11, fontweight="bold", y=1.01)
+    plt.tight_layout()
+    save(fig, out_dir, fname)
+
+
+def plot_patient_checkerboard_maps(data, score_col, head_label, out_dir, fname_prefix):
+    selected = _select_shared_patients_across_models(data, n_patients_per_group=8)
+    status_names = {0: "No Cancer", 1: "isPCa", 2: "csPCa"}
+    print(f"\n[Checkerboard selection — {head_label}]")
+    for status_id in [0, 1, 2]:
+        ids = selected.get(status_id, [])
+        print(f"  {status_names[status_id]} ({len(ids)}): {', '.join(map(str, ids)) if ids else 'None'}")
+
+    for name, df in data.items():
+        safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(name))
+        _plot_patient_checkerboard_single_model(
+            df=df,
+            score_col=score_col,
+            model_name=name,
+            head_label=head_label,
+            out_dir=out_dir,
+            fname=f"{fname_prefix}_{safe}",
+            selected_patients_by_status=selected,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -713,8 +1073,12 @@ def run(data: Dict[str, pd.DataFrame], output_dir: str):
                                  clf_dir, f"score_distributions_{grp}")
         plot_error_by_involvement(data, clf_col, "Classification Head", grp, "",
                                   clf_dir, f"error_by_involvement_{grp}")
-        plot_auroc_vs_threshold(data, clf_col, "Classification Head", grp, "",
+        # Keep legacy filename and also save a "_normal" variant for parity with
+        # heatmap-head outputs (easier side-by-side lookup by filename).
+        plot_auroc_vs_threshold(data, clf_col, "Classification Head", grp, "normal",
                                 clf_dir, f"auroc_vs_threshold_{grp}")
+        plot_auroc_vs_threshold(data, clf_col, "Classification Head", grp, "normal",
+                                clf_dir, f"auroc_vs_threshold_{grp}_normal")
         # Fixed threshold (fair cross-model comparison)
         plot_accuracy_by_involvement(data, clf_col, grp,
                                      clf_dir, f"accuracy_by_involvement_{grp}_fixed0.5",
@@ -745,6 +1109,15 @@ def run(data: Dict[str, pd.DataFrame], output_dir: str):
                                     pat_dir, "patient_score_dist_heatmap")
     plot_patient_sensitivity_bars(data, hm_col, "Heatmap Head",
                                   pat_dir, "patient_sensitivity_bars_heatmap")
+    plot_patient_balanced_accuracy_curve(
+        data, hm_col, "Heatmap Head", pat_dir, "patient_balanced_accuracy_curve_heatmap", agg="max"
+    )
+    plot_patient_balanced_accuracy_summary(
+        data, hm_col, "Heatmap Head", pat_dir, "patient_balanced_accuracy_summary_heatmap", agg="max"
+    )
+    plot_patient_checkerboard_maps(
+        data, hm_col, "Heatmap Head", pat_dir, "patient_checkerboard_heatmap"
+    )
 
     print("\n[Patient level — classification head]")
     plot_patient_roc(data, clf_col, "Classification Head", pat_dir, "patient_roc_clf")
@@ -752,6 +1125,15 @@ def run(data: Dict[str, pd.DataFrame], output_dir: str):
                                     pat_dir, "patient_score_dist_clf")
     plot_patient_sensitivity_bars(data, clf_col, "Classification Head",
                                   pat_dir, "patient_sensitivity_bars_clf")
+    plot_patient_balanced_accuracy_curve(
+        data, clf_col, "Classification Head", pat_dir, "patient_balanced_accuracy_curve_clf", agg="max"
+    )
+    plot_patient_balanced_accuracy_summary(
+        data, clf_col, "Classification Head", pat_dir, "patient_balanced_accuracy_summary_clf", agg="max"
+    )
+    plot_patient_checkerboard_maps(
+        data, clf_col, "Classification Head", pat_dir, "patient_checkerboard_clf"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

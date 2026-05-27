@@ -52,7 +52,9 @@ def trunc_normal_(tensor, mean=0.0, std=1.0, a=-2.0, b=2.0):
     return _no_grad_trunc_normal_(tensor, mean, std, a, b)
 
 
-def calculate_metrics(predictions, labels, log_images=False):
+def calculate_metrics(
+    predictions, labels, log_images=False, include_balanced_accuracy=True
+):
     """Calculate metrics for the cancer classification problem."""
 
     if isinstance(predictions, torch.Tensor):
@@ -67,12 +69,15 @@ def calculate_metrics(predictions, labels, log_images=False):
 
     if len(predictions) == 0:
         logging.warning("All predictions were NaN or empty. Returning NaN metrics.")
-        return {
+        metrics = {
             "core_auc": float("nan"),
             "sensitivity": float("nan"),
             "specificity": float("nan"),
             "f1": float("nan"),
         }
+        if include_balanced_accuracy:
+            metrics["balanced_accuracy"] = float("nan")
+        return metrics
 
     from sklearn.metrics import (
         balanced_accuracy_score,
@@ -92,12 +97,15 @@ def calculate_metrics(predictions, labels, log_images=False):
     unique_labels = np.unique(core_labels)
     if len(unique_labels) < 2:
         logging.warning(f"Only one class present in labels: {unique_labels}. Returning NaN metrics.")
-        return {
+        metrics = {
             "core_auc": float("nan"),
             "sensitivity": float("nan"),
             "specificity": float("nan"),
             "f1": float("nan"),
         }
+        if include_balanced_accuracy:
+            metrics["balanced_accuracy"] = float("nan")
+        return metrics
     
     metrics["core_auc"] = roc_auc_score(core_labels, core_probs)
 
@@ -114,6 +122,10 @@ def calculate_metrics(predictions, labels, log_images=False):
     # choose the threshold that maximizes balanced accuracy
     best_threshold = thresholds[np.argmax(tpr - fpr)]
     metrics["f1"] = f1_score(core_labels, core_probs > best_threshold)
+    if include_balanced_accuracy:
+        metrics["balanced_accuracy"] = balanced_accuracy_score(
+            core_labels, core_probs > 0.5
+        )
 
     if log_images:
         try:

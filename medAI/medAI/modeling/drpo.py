@@ -1,19 +1,4 @@
-"""
-DRPO - Domain-Robust Policy Optimization
-
-Based on GDPO with added hierarchical advantage scaling.
-Paper: https://arxiv.org/abs/2601.05242
-
-Key insight: DRPO = GDPO + hierarchical advantage scaling through:
-1. Intra-domain clustering (difficulty detection via K-Means)
-2. Domain temperature scaling (balances rare vs. common domains)
-3. Cluster temperature scaling (balances hard vs. easy samples)
-
-For ProstNFound-RL with unbalanced data (mostly benign, few cancer cases):
-- DRPO helps balance learning between rare cancer cases and common benign cases
-- Temperature scaling upweights hard-to-classify cancer samples
-- Domain clustering can group by clinical characteristics (PSA, age, grade)
-"""
+"""DRPO (Domain-Robust Policy Optimization), extending GDPO with hierarchical advantage scaling."""
 
 import torch
 import torch.nn as nn
@@ -190,8 +175,10 @@ class DRPO:
             n_samples_in_domain = domain_reward_vectors.shape[0]
             
             # Determine number of clusters for this domain
-            # Use min to avoid more clusters than samples
-            n_clusters = min(self.num_clusters, max(1, n_samples_in_domain // 2))
+            # Use min to avoid more clusters than samples or unique points
+            reward_vectors_cpu_pre = domain_reward_vectors.cpu().numpy()
+            n_unique = len(np.unique(reward_vectors_cpu_pre, axis=0))
+            n_clusters = min(self.num_clusters, max(1, n_samples_in_domain // 2), n_unique)
             
             if n_clusters <= 1 or n_samples_in_domain <= 1:
                 # Not enough samples to cluster
@@ -201,7 +188,7 @@ class DRPO:
                 continue
             
             # Run K-Means clustering (on CPU for sklearn)
-            reward_vectors_cpu = domain_reward_vectors.cpu().numpy()
+            reward_vectors_cpu = reward_vectors_cpu_pre
             
             try:
                 kmeans = KMeans(

@@ -309,10 +309,44 @@ def get_dataloaders(args, mode: Literal["train", "test", "heatmap"] = "train"):
     # evaluation-only cohorts). Avoid RandomSampler on empty datasets.
     train_shuffle = (mode == "train") and (len(train_dataset) > 0)
 
+    # Optional: center-balanced sampling — oversample minority centers so every
+    # center contributes equally to each epoch regardless of dataset size.
+    # Activated by args.center_balanced_sampling = True (default: False).
+    train_sampler = None
+    if (
+        mode == "train"
+        and len(train_dataset) > 0
+        and vars(args).get("center_balanced_sampling", False)
+        and hasattr(args, "dataset")
+        and args.dataset != "optimum"  # optimum has only one center (UA)
+    ):
+        from torch.utils.data import WeightedRandomSampler
+
+        # Extract center from core IDs (format: "CENTER-XXXX_LOC")
+        core_ids = getattr(train_dataset, "cores", None) or getattr(train_dataset, "core_ids", None)
+        if core_ids is not None and len(core_ids) > 0:
+            centers = [c.split("-")[0] for c in core_ids]
+            center_counts = {}
+            for c in centers:
+                center_counts[c] = center_counts.get(c, 0) + 1
+            # Weight each sample inversely proportional to its center frequency
+            sample_weights = [1.0 / center_counts[c] for c in centers]
+            train_sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+            train_shuffle = False  # sampler is mutually exclusive with shuffle
+            print(
+                f"[center_balanced_sampling] center counts: {center_counts}  "
+                f"n_samples={len(sample_weights)}"
+            )
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size if mode == "train" else 1,
         shuffle=train_shuffle,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=True,
     )

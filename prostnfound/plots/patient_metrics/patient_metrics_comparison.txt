@@ -1,219 +1,219 @@
 PATIENT-LEVEL METRICS COMPARISON
-Models: APO, ProstNFound
+Models: Supervised, ProstNFound
 
 
 ================================================================================
   HEAD: heatmap   |   SUBGROUP: all   (patient-level, max-score aggregation)
 ================================================================================
-Metric                                       APO       ProstNFound
+Metric                                Supervised       ProstNFound
 ------------------------------------------------------------------
-AUROC                                     0.7508            0.7598
-Bal.Acc @opt.thresh                       0.7154            0.7168
-Bal.Acc @0.50                             0.6116            0.5556
+AUROC                                     0.7506            0.7598
+Bal.Acc @opt.thresh                       0.6753            0.7168
+Bal.Acc @0.50                             0.5560            0.5556
 Sens @Spec40%                             0.8444            0.8667
-Sens @Spec50%                             0.7778            0.7778
-Sens @Spec60%                             0.7333            0.7111
-Sens @Spec70%                             0.6444            0.7111
-Sens @Spec80%                             0.6222            0.6000
-Sens @Spec90%                             0.4889            0.4667
+Sens @Spec50%                             0.8000            0.7778
+Sens @Spec60%                             0.7778            0.7111
+Sens @Spec70%                             0.6889            0.7111
+Sens @Spec80%                             0.5778            0.6000
+Sens @Spec90%                             0.4667            0.4667
 N patients                                   139               139
 N cancer                                      45                45
 N benign                                      94                94
 
 --- Core-level ---            
-Core AUROC                                0.8035            0.7957
-Core Bal.Acc @opt                         0.6968            0.7357
-Core Bal.Acc @0.50                        0.5599            0.5220
+Core AUROC                                0.8216            0.7957
+Core Bal.Acc @opt                         0.6293            0.7357
+Core Bal.Acc @0.50                        0.5336            0.5220
 N cores                                     1334              1334
 
 ================================================================================
   HEAD: heatmap   |   SUBGROUP: high_inv   (patient-level, max-score aggregation)
 ================================================================================
-Metric                                       APO       ProstNFound
+Metric                                Supervised       ProstNFound
 ------------------------------------------------------------------
-AUROC                                     0.8175            0.8215
-Bal.Acc @opt.thresh                       0.7796            0.7643
-Bal.Acc @0.50                             0.6144            0.5781
+AUROC                                     0.8112            0.8215
+Bal.Acc @opt.thresh                       0.7277            0.7643
+Bal.Acc @0.50                             0.5831            0.5781
 Sens @Spec40%                             0.9062            0.9375
-Sens @Spec50%                             0.8438            0.8438
-Sens @Spec60%                             0.8125            0.7812
+Sens @Spec50%                             0.8750            0.8438
+Sens @Spec60%                             0.8438            0.7812
 Sens @Spec70%                             0.7500            0.7812
-Sens @Spec80%                             0.7500            0.6875
-Sens @Spec90%                             0.5938            0.5625
+Sens @Spec80%                             0.6562            0.6875
+Sens @Spec90%                             0.5625            0.5625
 N patients                                   126               126
 N cancer                                      32                32
 N benign                                      94                94
 
 --- Core-level ---            
-Core AUROC                                0.8035            0.7957
-Core Bal.Acc @opt                         0.6968            0.7357
-Core Bal.Acc @0.50                        0.5599            0.5220
+Core AUROC                                0.8216            0.7957
+Core Bal.Acc @opt                         0.6293            0.7357
+Core Bal.Acc @0.50                        0.5336            0.5220
 N cores                                     1334              1334
 
 ================================================================================
   HEAD: heatmap   |   SUBGROUP: cspca   (patient-level, max-score aggregation)
 ================================================================================
-Metric                                       APO       ProstNFound
+Metric                                Supervised       ProstNFound
 ------------------------------------------------------------------
-AUROC                                     0.8236            0.8438
-Bal.Acc @opt.thresh                       0.7727            0.8046
+AUROC                                     0.8466            0.8438
+Bal.Acc @opt.thresh                       0.7203            0.8046
 Bal.Acc @0.50                             0.5946            0.5526
 Sens @Spec40%                             0.9474            0.9474
-Sens @Spec50%                             0.8947            0.8421
-Sens @Spec60%                             0.8421            0.8421
-Sens @Spec70%                             0.7895            0.8421
-Sens @Spec80%                             0.7368            0.7368
+Sens @Spec50%                             0.9474            0.8421
+Sens @Spec60%                             0.9474            0.8421
+Sens @Spec70%                             0.8421            0.8421
+Sens @Spec80%                             0.6842            0.7368
 Sens @Spec90%                             0.5263            0.5263
 N patients                                   113               113
 N cancer                                      19                19
 N benign                                      94                94
 
 --- Core-level ---            
-Core AUROC                                0.8035            0.7957
-Core Bal.Acc @opt                         0.6968            0.7357
-Core Bal.Acc @0.50                        0.5599            0.5220
+Core AUROC                                0.8216            0.7957
+Core Bal.Acc @opt                         0.6293            0.7357
+Core Bal.Acc @0.50                        0.5336            0.5220
 N cores                                     1334              1334
 
 ================================================================================
   HEAD: heatmap_thresh   |   SUBGROUP: all   (patient-level, max-score aggregation)
 ================================================================================
-Metric                                       APO       ProstNFound
+Metric                                Supervised       ProstNFound
 ------------------------------------------------------------------
-AUROC                                     0.6988               —  
-Bal.Acc @opt.thresh                       0.6743               —  
-Bal.Acc @0.50                             0.6116               —  
+AUROC                                     0.6246               —  
+Bal.Acc @opt.thresh                       0.6067               —  
+Bal.Acc @0.50                             0.5560               —  
 Sens @Spec40%                             1.0000               —  
 Sens @Spec50%                             1.0000               —  
 Sens @Spec60%                             1.0000               —  
 Sens @Spec70%                             1.0000               —  
 Sens @Spec80%                             1.0000               —  
-Sens @Spec90%                             0.4889               —  
+Sens @Spec90%                             1.0000               —  
 N patients                                   139               —  
 N cancer                                      45               —  
 N benign                                      94               —  
 
 --- Core-level ---            
-Core AUROC                                0.6244               —  
-Core Bal.Acc @opt                         0.5982               —  
-Core Bal.Acc @0.50                        0.5599               —  
+Core AUROC                                0.5945               —  
+Core Bal.Acc @opt                         0.5751               —  
+Core Bal.Acc @0.50                        0.5345               —  
 N cores                                     1334               —  
 
 ================================================================================
   HEAD: heatmap_thresh   |   SUBGROUP: high_inv   (patient-level, max-score aggregation)
 ================================================================================
-Metric                                       APO       ProstNFound
+Metric                                Supervised       ProstNFound
 ------------------------------------------------------------------
-AUROC                                     0.7555               —  
-Bal.Acc @opt.thresh                       0.7178               —  
-Bal.Acc @0.50                             0.6144               —  
+AUROC                                     0.6792               —  
+Bal.Acc @opt.thresh                       0.6609               —  
+Bal.Acc @0.50                             0.5831               —  
 Sens @Spec40%                             1.0000               —  
 Sens @Spec50%                             1.0000               —  
 Sens @Spec60%                             1.0000               —  
 Sens @Spec70%                             1.0000               —  
 Sens @Spec80%                             1.0000               —  
-Sens @Spec90%                             0.5938               —  
+Sens @Spec90%                             1.0000               —  
 N patients                                   126               —  
 N cancer                                      32               —  
 N benign                                      94               —  
 
 --- Core-level ---            
-Core AUROC                                0.6244               —  
-Core Bal.Acc @opt                         0.5982               —  
-Core Bal.Acc @0.50                        0.5599               —  
+Core AUROC                                0.5945               —  
+Core Bal.Acc @opt                         0.5751               —  
+Core Bal.Acc @0.50                        0.5345               —  
 N cores                                     1334               —  
 
 ================================================================================
   HEAD: heatmap_thresh   |   SUBGROUP: cspca   (patient-level, max-score aggregation)
 ================================================================================
-Metric                                       APO       ProstNFound
+Metric                                Supervised       ProstNFound
 ------------------------------------------------------------------
-AUROC                                     0.7318               —  
-Bal.Acc @opt.thresh                       0.7153               —  
+AUROC                                     0.6971               —  
+Bal.Acc @opt.thresh                       0.6629               —  
 Bal.Acc @0.50                             0.5946               —  
 Sens @Spec40%                             1.0000               —  
 Sens @Spec50%                             1.0000               —  
 Sens @Spec60%                             1.0000               —  
 Sens @Spec70%                             1.0000               —  
 Sens @Spec80%                             1.0000               —  
-Sens @Spec90%                             0.5789               —  
+Sens @Spec90%                             1.0000               —  
 N patients                                   113               —  
 N cancer                                      19               —  
 N benign                                      94               —  
 
 --- Core-level ---            
-Core AUROC                                0.6244               —  
-Core Bal.Acc @opt                         0.5982               —  
-Core Bal.Acc @0.50                        0.5599               —  
+Core AUROC                                0.5945               —  
+Core Bal.Acc @opt                         0.5751               —  
+Core Bal.Acc @0.50                        0.5345               —  
 N cores                                     1334               —  
 
 ================================================================================
   HEAD: clf   |   SUBGROUP: all   (patient-level, max-score aggregation)
 ================================================================================
-Metric                                       APO       ProstNFound
+Metric                                Supervised       ProstNFound
 ------------------------------------------------------------------
-AUROC                                     0.7111            0.6986
-Bal.Acc @opt.thresh                       0.6888            0.6656
-Bal.Acc @0.50                             0.6704            0.5000
+AUROC                                     0.7073            0.6986
+Bal.Acc @opt.thresh                       0.6548            0.6656
+Bal.Acc @0.50                             0.6188            0.5000
 Sens @Spec40%                             0.8000            0.8222
-Sens @Spec50%                             0.7556            0.7556
-Sens @Spec60%                             0.6444            0.6667
+Sens @Spec50%                             0.7778            0.7556
+Sens @Spec60%                             0.6889            0.6667
 Sens @Spec70%                             0.6222            0.5556
-Sens @Spec80%                             0.5333            0.4444
-Sens @Spec90%                             0.3778            0.2889
+Sens @Spec80%                             0.4444            0.4444
+Sens @Spec90%                             0.3333            0.2889
 N patients                                   139               139
 N cancer                                      45                45
 N benign                                      94                94
 
 --- Core-level ---            
-Core AUROC                                0.7950            0.7684
-Core Bal.Acc @opt                         0.7336            0.7073
-Core Bal.Acc @0.50                        0.6529            0.5000
+Core AUROC                                0.8015            0.7684
+Core Bal.Acc @opt                         0.7436            0.7073
+Core Bal.Acc @0.50                        0.5858            0.5000
 N cores                                     1336              1336
 
 ================================================================================
   HEAD: clf   |   SUBGROUP: high_inv   (patient-level, max-score aggregation)
 ================================================================================
-Metric                                       APO       ProstNFound
+Metric                                Supervised       ProstNFound
 ------------------------------------------------------------------
-AUROC                                     0.7716            0.7434
-Bal.Acc @opt.thresh                       0.7370            0.6958
-Bal.Acc @0.50                             0.7118            0.5000
+AUROC                                     0.7670            0.7434
+Bal.Acc @opt.thresh                       0.7035            0.6958
+Bal.Acc @0.50                             0.6709            0.5000
 Sens @Spec40%                             0.8750            0.8750
-Sens @Spec50%                             0.8438            0.8438
+Sens @Spec50%                             0.8750            0.8438
 Sens @Spec60%                             0.7500            0.7188
-Sens @Spec70%                             0.7188            0.6250
-Sens @Spec80%                             0.5938            0.5000
-Sens @Spec90%                             0.4688            0.3438
+Sens @Spec70%                             0.6875            0.6250
+Sens @Spec80%                             0.5312            0.5000
+Sens @Spec90%                             0.4375            0.3438
 N patients                                   126               126
 N cancer                                      32                32
 N benign                                      94                94
 
 --- Core-level ---            
-Core AUROC                                0.7950            0.7684
-Core Bal.Acc @opt                         0.7336            0.7073
-Core Bal.Acc @0.50                        0.6529            0.5000
+Core AUROC                                0.8015            0.7684
+Core Bal.Acc @opt                         0.7436            0.7073
+Core Bal.Acc @0.50                        0.5858            0.5000
 N cores                                     1336              1336
 
 ================================================================================
   HEAD: clf   |   SUBGROUP: cspca   (patient-level, max-score aggregation)
 ================================================================================
-Metric                                       APO       ProstNFound
+Metric                                Supervised       ProstNFound
 ------------------------------------------------------------------
-AUROC                                     0.8035            0.7682
-Bal.Acc @opt.thresh                       0.7724            0.7410
-Bal.Acc @0.50                             0.7307            0.5000
-Sens @Spec40%                             0.9474            0.9474
-Sens @Spec50%                             0.8421            0.8421
-Sens @Spec60%                             0.7895            0.8421
-Sens @Spec70%                             0.7895            0.6842
-Sens @Spec80%                             0.6842            0.5263
-Sens @Spec90%                             0.4737            0.3158
+AUROC                                     0.7996            0.7682
+Bal.Acc @opt.thresh                       0.7612            0.7410
+Bal.Acc @0.50                             0.6627            0.5000
+Sens @Spec40%                             0.8947            0.9474
+Sens @Spec50%                             0.8947            0.8421
+Sens @Spec60%                             0.8947            0.8421
+Sens @Spec70%                             0.8421            0.6842
+Sens @Spec80%                             0.5263            0.5263
+Sens @Spec90%                             0.4211            0.3158
 N patients                                   113               113
 N cancer                                      19                19
 N benign                                      94                94
 
 --- Core-level ---            
-Core AUROC                                0.7950            0.7684
-Core Bal.Acc @opt                         0.7336            0.7073
-Core Bal.Acc @0.50                        0.6529            0.5000
+Core AUROC                                0.8015            0.7684
+Core Bal.Acc @opt                         0.7436            0.7073
+Core Bal.Acc @0.50                        0.5858            0.5000
 N cores                                     1336              1336

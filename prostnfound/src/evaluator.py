@@ -113,6 +113,7 @@ class CancerLogitsHeatmapsEvaluator:
         log_images_every=10,
         include_patient_metrics=False,
         include_heatmap_cspca_metrics=True,
+        include_balanced_accuracy=True,
     ):
         self.iter = 0
         self.log_images = log_images
@@ -121,6 +122,7 @@ class CancerLogitsHeatmapsEvaluator:
         self.accumulator = DataFrameCollector()
         self._heatmap_fig = None
         self.include_heatmap_cspca_metrics = include_heatmap_cspca_metrics
+        self.include_balanced_accuracy = include_balanced_accuracy
         self.results_table = None
 
     @torch.no_grad()
@@ -207,7 +209,12 @@ class CancerLogitsHeatmapsEvaluator:
         core_labels = labels
 
         metrics = {}
-        metrics_ = calculate_metrics(predictions, labels, log_images=self.log_images)
+        metrics_ = calculate_metrics(
+            predictions,
+            labels,
+            log_images=self.log_images,
+            include_balanced_accuracy=self.include_balanced_accuracy,
+        )
         metrics.update(metrics_)
 
         metrics["topk_probs_auroc"] = _auc_roc(results_table.topk_score.values, labels)
@@ -283,7 +290,10 @@ class CancerLogitsHeatmapsEvaluator:
             core_probs = core_probs[keep]
             core_labels = core_labels[keep]
             metrics_ = calculate_metrics(
-                core_probs, core_labels, log_images=self.log_images
+                core_probs,
+                core_labels,
+                log_images=self.log_images,
+                include_balanced_accuracy=self.include_balanced_accuracy,
             )
             metrics.update(
                 {
@@ -306,7 +316,10 @@ class CancerLogitsHeatmapsEvaluator:
                 results_table.groupby("patient_id").clinically_significant.sum() > 0
             ).values
             metrics_ = calculate_metrics(
-                predictions, labels, log_images=self.log_images
+                predictions,
+                labels,
+                log_images=self.log_images,
+                include_balanced_accuracy=self.include_balanced_accuracy,
             )
             metrics.update(
                 {f"{metric}_patient": value for metric, value in metrics_.items()}
@@ -316,7 +329,10 @@ class CancerLogitsHeatmapsEvaluator:
             image_level_predictions = results_table.image_level_cancer_logits.values
             image_level_labels = results_table.label.values
             metrics_ = calculate_metrics(
-                image_level_predictions, image_level_labels, log_images=self.log_images
+                image_level_predictions,
+                image_level_labels,
+                log_images=self.log_images,
+                include_balanced_accuracy=self.include_balanced_accuracy,
             )
             metrics.update(
                 {f"{metric}_image_level": value for metric, value in metrics_.items()}
@@ -324,7 +340,10 @@ class CancerLogitsHeatmapsEvaluator:
 
             image_level_labels = (results_table.grade_group.values > 2).astype(int)
             metrics_low_vs_high = metrics_ = calculate_metrics(
-                image_level_predictions, image_level_labels, log_images=self.log_images
+                image_level_predictions,
+                image_level_labels,
+                log_images=self.log_images,
+                include_balanced_accuracy=self.include_balanced_accuracy,
             )
             metrics.update(
                 {
@@ -349,7 +368,10 @@ class CancerLogitsHeatmapsEvaluator:
             heatmap_predictions = results_table["average_needle_heatmap_value"]
             image_level_labels = (results_table.grade_group.values > 2).astype(int)
             metrics_ = calculate_metrics(
-                heatmap_predictions, image_level_labels, log_images=self.log_images
+                heatmap_predictions,
+                image_level_labels,
+                log_images=self.log_images,
+                include_balanced_accuracy=self.include_balanced_accuracy,
             )
             metrics.update(
                 {

@@ -211,60 +211,85 @@ def run_train_epoch(
     # setup epoch
     model.train()
     evaluator = Evaluator(**args.evaluator)
+    
+    # Detect if using SAM optimizer
+    _is_sam = hasattr(optimizer, 'first_step') and hasattr(optimizer, 'second_step')
 
     for train_iter, data in enumerate(tqdm(loader, desc=desc)):
 
         if args.debug and train_iter > 10:
             break
 
-        # run the model
-        # with torch.cuda.amp.autocast(enabled=args.use_amp):
-        with torch.amp.autocast('cuda', enabled=args.use_amp):
-            data = model(data)  # heatmap
-
+        if _is_sam:
+            # ============================================================
+            # SAM two-step training (no AMP — SAM doesn't support GradScaler)
+            # ============================================================
+            # First forward-backward pass
+            data = model(data)
             if torch.any(torch.isnan(data["cancer_logits"])):
                 logging.warning("NaNs in heatmap logits")
-
-            # loss calculation
             loss = criterion(data)
-
-        loss = loss / args.accumulate_grad_steps
-        # backward pass
-        if args.use_amp:
-            logging.debug("Backward pass")
-            scaler.scale(loss).backward()
-        else:
-            logging.debug("Backward pass")
             loss.backward()
+            optimizer.first_step(zero_grad=True)
+            
+            # Second forward-backward pass (full recompute)
+            data_second = model(data)
+            loss_second = criterion(data_second)
+            loss_second.backward()
+            optimizer.second_step(zero_grad=True)
+            
+            scheduler.step()
+        else:
+            # ============================================================
+            # Standard AdamW training
+            # ============================================================
+            # run the model
+            with torch.amp.autocast('cuda', enabled=args.use_amp):
+                data = model(data)  # heatmap
 
-        # gradient accumulation and optimizer step
-        if args.debug:
-            for param in optimizer.param_groups[1]["params"]:
-                break
-            logging.debug(param.data.view(-1)[0])
+                if torch.any(torch.isnan(data["cancer_logits"])):
+                    logging.warning("NaNs in heatmap logits")
 
-        if (train_iter + 1) % args.accumulate_grad_steps == 0:
-            logging.debug("Optimizer step")
+                # loss calculation
+                loss = criterion(data)
+
+            loss = loss / args.accumulate_grad_steps
+            # backward pass
             if args.use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
+                logging.debug("Backward pass")
+                scaler.scale(loss).backward()
             else:
-                optimizer.step()
-                optimizer.zero_grad()
+                logging.debug("Backward pass")
+                loss.backward()
 
+            # gradient accumulation and optimizer step
             if args.debug:
                 for param in optimizer.param_groups[1]["params"]:
                     break
                 logging.debug(param.data.view(-1)[0])
 
-        scheduler.step()
+            if (train_iter + 1) % args.accumulate_grad_steps == 0:
+                logging.debug("Optimizer step")
+                if args.use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                if args.debug:
+                    for param in optimizer.param_groups[1]["params"]:
+                        break
+                    logging.debug(param.data.view(-1)[0])
+
+            scheduler.step()
 
         # accumulate outputs
         step_metrics = {f"train/{k}": v for k, v in evaluator(data).items()}
 
         # log metrics
-        step_metrics.update({"train_loss": loss.item() / args.accumulate_grad_steps})
+        step_metrics.update({"train_loss": loss.item() * (1 if _is_sam else 1.0 / args.accumulate_grad_steps)})
         encoder_lr = optimizer.param_groups[0]["lr"]
         main_lr = optimizer.param_groups[1]["lr"]
         cnn_lr = optimizer.param_groups[2]["lr"]
@@ -399,17 +424,45 @@ def setup_optimizer(args, model, train_loader):
                 ) * niter_per_ep
                 return 0.5 * (1 + np.cos(np.pi * cur_iter / total_iter))
 
-    optimizer = AdamW(params, lr=args.lr, weight_decay=args.wd)
-    from torch.optim.lr_scheduler import LambdaLR
-
-    lr_scheduler = LambdaLR(
-        optimizer,
-        [
-            lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
-            lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=False),
-            lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
-        ],
-    )
+    # Check if SAM optimizer is requested
+    use_sam = args.get('optimizer', 'adamw').lower() == 'sam'
+    
+    if use_sam:
+        import sys, os
+        sam_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sam')
+        if sam_dir not in sys.path:
+            sys.path.insert(0, sam_dir)
+        from sam import SAM
+        
+        sam_rho = args.get('sam_rho', 0.05)
+        sam_adaptive = args.get('sam_adaptive', False)
+        logging.info(f"Using SAM optimizer (rho={sam_rho}, adaptive={sam_adaptive}) wrapping AdamW")
+        
+        optimizer = SAM(
+            params, AdamW, rho=sam_rho, adaptive=sam_adaptive,
+            lr=args.lr, weight_decay=args.wd
+        )
+        # LR scheduler should be attached to the base optimizer for SAM
+        from torch.optim.lr_scheduler import LambdaLR
+        lr_scheduler = LambdaLR(
+            optimizer.base_optimizer,
+            [
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=False),
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
+            ],
+        )
+    else:
+        optimizer = AdamW(params, lr=args.lr, weight_decay=args.wd)
+        from torch.optim.lr_scheduler import LambdaLR
+        lr_scheduler = LambdaLR(
+            optimizer,
+            [
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=False),
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
+            ],
+        )
 
     return optimizer, lr_scheduler
 

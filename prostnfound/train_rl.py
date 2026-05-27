@@ -1,18 +1,4 @@
-"""
-Training script for ProstNFound-RL with GRPO/GDPO
-
-This is a modified version of train.py that supports RL training with:
-- PPO: Proximal Policy Optimization (with value function)
-- GRPO: Group Relative Policy Optimization (no value function)
-- GDPO: Group reward-Decoupled normalization Policy Optimization (multi-reward)
-
-Key Optimizations (v2):
-1. Batched forward passes: All samples computed in ONE forward pass
-2. Pure GRPO without value function (like Seg-R1)
-3. Group-based advantage normalization within each image
-4. Configurable prostate mask constraint
-5. GDPO for multi-reward training with decoupled normalization
-"""
+"""Training entry point for Prost-RL (supervised and RL modes)."""
 
 import argparse
 from collections import defaultdict
@@ -85,6 +71,188 @@ from PIL import Image
 OmegaConf.register_new_resolver('getenv', os.getenv)
 
 
+# =============================================================================
+# Alternating Training: Freeze/Unfreeze helpers
+# =============================================================================
+
+def _get_rl_model(model):
+    """Extract the ProstNFoundRLV2 from ProstNFoundMeta wrapper."""
+    if hasattr(model, 'model'):
+        return model.model  # ProstNFoundMeta wraps model
+    return model
+
+
+def freeze_encoder(model):
+    """Freeze the image encoder (ViT backbone) during RL phase."""
+    rl_model = _get_rl_model(model)
+    if hasattr(rl_model, 'prostnfound'):
+        for param in rl_model.prostnfound.medsam_model.image_encoder.parameters():
+            param.requires_grad = False
+        if rl_model.prostnfound.upsample is not None:
+            for param in rl_model.prostnfound.upsample.parameters():
+                param.requires_grad = False
+        logging.info("  [ALTERNATING] Encoder FROZEN")
+
+
+def freeze_decoder(model):
+    """Freeze decoder components: mask_decoder, class_decoder, prompt_encoder, prompts."""
+    rl_model = _get_rl_model(model)
+    if hasattr(rl_model, 'prostnfound'):
+        pnf = rl_model.prostnfound
+        # Mask decoder (heatmap)
+        for param in pnf.medsam_model.mask_decoder.parameters():
+            param.requires_grad = False
+        # Prompt encoder
+        for param in pnf.medsam_model.prompt_encoder.parameters():
+            param.requires_grad = False
+        # Class decoder (classification head)
+        if pnf.class_decoder is not None:
+            for param in pnf.class_decoder.parameters():
+                param.requires_grad = False
+        # Prompt modules
+        for module in pnf.floating_point_prompt_modules.values():
+            for param in module.parameters():
+                param.requires_grad = False
+        for module in pnf.integer_prompt_modules.values():
+            for param in module.parameters():
+                param.requires_grad = False
+        # Encoder neck (part of decoder pathway)
+        for param in pnf.medsam_model.image_encoder.neck.parameters():
+            param.requires_grad = False
+        # Temperature and bias
+        if hasattr(pnf, 'temperature') and isinstance(pnf.temperature, nn.Parameter):
+            pnf.temperature.requires_grad = False
+        if hasattr(pnf, 'bias') and isinstance(pnf.bias, nn.Parameter):
+            pnf.bias.requires_grad = False
+        # Null prompt
+        pnf.null_prompt.requires_grad = False
+        # Data independent prompts
+        if pnf.num_data_independent_prompts > 0 and hasattr(pnf, 'data_independent_prompts'):
+            pnf.data_independent_prompts.requires_grad = False
+        # CNN dense embedding
+        if pnf.cnn_for_dense_embedding is not None:
+            for param in pnf.cnn_for_dense_embedding.parameters():
+                param.requires_grad = False
+        logging.info("  [ALTERNATING] Decoder FROZEN (mask_decoder, class_decoder, prompts)")
+
+
+def freeze_policy(model):
+    """Freeze RL policy components: policy network, attention modulation/projection, value network."""
+    rl_model = _get_rl_model(model)
+    if hasattr(rl_model, 'policy'):
+        for param in rl_model.policy.parameters():
+            param.requires_grad = False
+        logging.info("  [ALTERNATING] Policy FROZEN")
+    if hasattr(rl_model, 'attention_modulation'):
+        for param in rl_model.attention_modulation.parameters():
+            param.requires_grad = False
+        logging.info("  [ALTERNATING] Attention modulation FROZEN")
+    if hasattr(rl_model, 'attention_projection'):
+        for param in rl_model.attention_projection.parameters():
+            param.requires_grad = False
+        logging.info("  [ALTERNATING] Attention projection FROZEN")
+    if hasattr(rl_model, 'value_network') and rl_model.value_network is not None:
+        for param in rl_model.value_network.parameters():
+            param.requires_grad = False
+        logging.info("  [ALTERNATING] Value network FROZEN")
+
+
+def unfreeze_decoder(model):
+    """Unfreeze decoder components."""
+    rl_model = _get_rl_model(model)
+    if hasattr(rl_model, 'prostnfound'):
+        pnf = rl_model.prostnfound
+        for param in pnf.medsam_model.mask_decoder.parameters():
+            param.requires_grad = True
+        for param in pnf.medsam_model.prompt_encoder.parameters():
+            param.requires_grad = True
+        if pnf.class_decoder is not None:
+            for param in pnf.class_decoder.parameters():
+                param.requires_grad = True
+        for module in pnf.floating_point_prompt_modules.values():
+            for param in module.parameters():
+                param.requires_grad = True
+        for module in pnf.integer_prompt_modules.values():
+            for param in module.parameters():
+                param.requires_grad = True
+        for param in pnf.medsam_model.image_encoder.neck.parameters():
+            param.requires_grad = True
+        pnf.null_prompt.requires_grad = True
+        if pnf.num_data_independent_prompts > 0 and hasattr(pnf, 'data_independent_prompts'):
+            pnf.data_independent_prompts.requires_grad = True
+        if pnf.cnn_for_dense_embedding is not None:
+            for param in pnf.cnn_for_dense_embedding.parameters():
+                param.requires_grad = True
+        logging.info("  [ALTERNATING] Decoder UNFROZEN")
+
+
+def unfreeze_policy(model):
+    """Unfreeze RL policy components."""
+    rl_model = _get_rl_model(model)
+    if hasattr(rl_model, 'policy'):
+        for param in rl_model.policy.parameters():
+            param.requires_grad = True
+        logging.info("  [ALTERNATING] Policy UNFROZEN")
+    if hasattr(rl_model, 'attention_modulation'):
+        for param in rl_model.attention_modulation.parameters():
+            param.requires_grad = True
+    if hasattr(rl_model, 'attention_projection'):
+        for param in rl_model.attention_projection.parameters():
+            param.requires_grad = True
+    if hasattr(rl_model, 'value_network') and rl_model.value_network is not None:
+        for param in rl_model.value_network.parameters():
+            param.requires_grad = True
+        logging.info("  [ALTERNATING] Value network UNFROZEN")
+
+
+def freeze_all_except_value(model):
+    """Freeze everything except the value network (for value warmup phase).
+    
+    During value warmup, we run RL rollouts and train ONLY the value function
+    to predict rewards. This gives V(s) a good baseline before PPO starts.
+    """
+    rl_model = _get_rl_model(model)
+    # Freeze encoder
+    freeze_encoder(model)
+    # Freeze decoder
+    freeze_decoder(model)
+    # Freeze policy (but NOT value network)
+    if hasattr(rl_model, 'policy'):
+        for param in rl_model.policy.parameters():
+            param.requires_grad = False
+    if hasattr(rl_model, 'attention_modulation'):
+        for param in rl_model.attention_modulation.parameters():
+            param.requires_grad = False
+    if hasattr(rl_model, 'attention_projection'):
+        for param in rl_model.attention_projection.parameters():
+            param.requires_grad = False
+    # Unfreeze ONLY value network
+    if hasattr(rl_model, 'value_network') and rl_model.value_network is not None:
+        for param in rl_model.value_network.parameters():
+            param.requires_grad = True
+        logging.info("  [VALUE WARMUP] Value network UNFROZEN (everything else frozen)")
+    else:
+        logging.warning("  [VALUE WARMUP] No value network found! Value warmup will have no effect.")
+
+
+def unfreeze_for_ppo(model):
+    """Unfreeze decoder + policy + value for full PPO training.
+    
+    Encoder stays frozen. This is called after value warmup.
+    """
+    unfreeze_decoder(model)
+    unfreeze_policy(model)  # Also unfreezes value network
+    logging.info("  [PPO] Decoder + policy + value UNFROZEN for full PPO training")
+
+
+def log_trainable_params(model):
+    """Log count of trainable vs frozen parameters."""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    logging.info(f"  [ALTERNATING] Params: {trainable:,} trainable / {frozen:,} frozen / {total:,} total")
+
+
 def main(cfg):
     # setup
     if cfg.checkpoint_dir is not None:
@@ -155,6 +323,7 @@ def main(cfg):
         is_rl=is_rl_model,
         apply_prostate_mask_to_decoder=apply_prostate_mask_to_decoder,
         boundary_tolerance_patches=boundary_tolerance_patches,
+        sar_noise_scale=cfg.get('sar_noise_scale', 0.0),
     )
 
 
@@ -367,6 +536,8 @@ def main(cfg):
             "rng": get_all_rng_states(),
             "lr_scheduler": lr_scheduler.state_dict(),
             "args": OmegaConf.to_object(cfg),
+            "value_warmup_completed": value_warmup_completed,
+            "joint_phase_started": joint_phase_started,
         }
 
     def save_checkpoint(name):
@@ -389,33 +560,177 @@ def main(cfg):
     # Phased training: Supervised warmup followed by RL fine-tuning
     # This mimics RLHF approach - supervised pre-training then RL
     rl_supervised_warmup_epochs = cfg.get('rl_supervised_warmup_epochs', 0)
-    if rl_supervised_warmup_epochs > 0 and use_rl and is_rl_model:
+    rl_alternating_training = cfg.get('rl_alternating_training', False)
+    rl_alternating_freeze_encoder = cfg.get('rl_alternating_freeze_encoder', True)
+    
+    # Value warmup phase: train only the value function before starting PPO
+    rl_value_warmup_epochs = cfg.get('rl_value_warmup_epochs', 0)
+    
+    # Phase 3: Joint fine-tuning (optional, only with alternating training)
+    rl_joint_finetune_epochs = cfg.get('rl_joint_finetune_epochs', 0)
+    rl_joint_noise_scale = cfg.get('rl_joint_noise_scale', 0.05)
+    rl_joint_lr_factor = cfg.get('rl_joint_lr_factor', 0.1)  # 10x LR reduction
+    
+    # Compute phase boundaries
+    if rl_alternating_training and rl_joint_finetune_epochs > 0:
+        alternating_end_epoch = cfg.epochs - rl_joint_finetune_epochs
+        joint_start_epoch = alternating_end_epoch
+    else:
+        alternating_end_epoch = cfg.epochs
+        joint_start_epoch = cfg.epochs  # No joint phase
+    
+    # Store the original noise scale so we can restore it if needed
+    original_noise_scale = None
+    joint_phase_started = False
+    value_warmup_completed = False
+    if state is not None:
+        joint_phase_started = bool(state.get("joint_phase_started", False))
+        value_warmup_completed = bool(state.get("value_warmup_completed", False))
+        # Backward-compatible fallback for older checkpoints that don't persist
+        # phase flags: if resuming already inside joint phase, avoid reapplying
+        # joint LR/noise transition updates.
+        if (
+            not joint_phase_started
+            and rl_alternating_training
+            and rl_joint_finetune_epochs > 0
+            and epoch >= joint_start_epoch
+        ):
+            joint_phase_started = True
+            logging.info(
+                "Resuming in joint phase; keeping loaded LR/noise state "
+                "(skip additional joint transition scaling)."
+            )
+        # Resume: if already past value warmup, mark as completed
+        if not value_warmup_completed and rl_value_warmup_epochs > 0 and epoch >= rl_value_warmup_epochs:
+            value_warmup_completed = True
+            logging.info("Resuming past value warmup phase.")
+    
+    if rl_value_warmup_epochs > 0 and use_rl and is_rl_model:
+        ppo_epochs = cfg.epochs - rl_value_warmup_epochs
+        logging.info(f"=== PPO VALUE WARMUP MODE ===")
+        logging.info(f"Phase 1: VALUE WARMUP for {rl_value_warmup_epochs} epochs (0-{rl_value_warmup_epochs - 1})")
+        logging.info(f"  - Only value_network trains, everything else frozen")
+        logging.info(f"  - RL rollouts run to collect rewards for value fitting")
+        logging.info(f"Phase 2: FULL PPO for {ppo_epochs} epochs ({rl_value_warmup_epochs}-{cfg.epochs - 1})")
+        logging.info(f"  - Decoder + policy + value all unfrozen, encoder frozen")
+        # Freeze everything except value for the warmup phase
+        if not value_warmup_completed:
+            freeze_all_except_value(model)
+            log_trainable_params(model)
+    elif rl_supervised_warmup_epochs > 0 and use_rl and is_rl_model:
         logging.info(f"=== PHASED TRAINING MODE ===")
-        logging.info(f"Phase 1: Supervised warmup for {rl_supervised_warmup_epochs} epochs")
-        logging.info(f"Phase 2: RL fine-tuning for {cfg.epochs - rl_supervised_warmup_epochs} epochs")
+        logging.info(f"Phase 1: Supervised warmup for {rl_supervised_warmup_epochs} epochs (0-{rl_supervised_warmup_epochs - 1})")
+        if rl_alternating_training:
+            alt_epochs = alternating_end_epoch - rl_supervised_warmup_epochs
+            logging.info(f"Phase 2: ALTERNATING RL/Decoder fine-tuning for {alt_epochs} epochs ({rl_supervised_warmup_epochs}-{alternating_end_epoch - 1})")
+            logging.info(f"  - Even RL-phase offsets (0, 2, 4, ...): Train POLICY only (freeze decoder + encoder)")
+            logging.info(f"  - Odd RL-phase offsets (1, 3, 5, ...): Train DECODER only (freeze policy + encoder)")
+            logging.info(f"  - Encoder frozen during RL: {rl_alternating_freeze_encoder}")
+            if rl_joint_finetune_epochs > 0:
+                logging.info(f"Phase 3: JOINT fine-tuning for {rl_joint_finetune_epochs} epochs ({joint_start_epoch}-{cfg.epochs - 1})")
+                logging.info(f"  - Both policy + decoder unfrozen, encoder frozen")
+                logging.info(f"  - Noise scale: {rl_joint_noise_scale} (reduced for micro-adjustments)")
+                logging.info(f"  - LR factor: {rl_joint_lr_factor}x (10x reduction)")
+        else:
+            logging.info(f"Phase 2: RL fine-tuning for {cfg.epochs - rl_supervised_warmup_epochs} epochs")
+
+    # Enforce encoder freeze for alternating RL mode even when warmup is 0 and
+    # after resume, so encoder behavior is deterministic across restarts.
+    if (
+        use_rl
+        and is_rl_model
+        and rl_alternating_training
+        and rl_alternating_freeze_encoder
+        and epoch >= rl_supervised_warmup_epochs
+    ):
+        freeze_encoder(model)
     
     for epoch in range(epoch, cfg.epochs):
         if cfg.cutoff_epoch is not None and epoch > cfg.cutoff_epoch:
             break
         
-        # Determine if we're in supervised warmup phase or RL phase
-        in_supervised_warmup = epoch < rl_supervised_warmup_epochs
+        # Determine which phase we're in
+        in_value_warmup = rl_value_warmup_epochs > 0 and epoch < rl_value_warmup_epochs and use_rl and is_rl_model
+        in_supervised_warmup = epoch < rl_supervised_warmup_epochs and not in_value_warmup
+        in_joint_phase = rl_alternating_training and rl_joint_finetune_epochs > 0 and epoch >= joint_start_epoch
+        in_alternating_phase = rl_alternating_training and not in_supervised_warmup and not in_joint_phase and not in_value_warmup
         use_rl_this_epoch = use_rl and is_rl_model and not in_supervised_warmup
         
-        # Log phase transition
+        # === Phase transition: Supervised → Alternating/RL ===
         if epoch == rl_supervised_warmup_epochs and rl_supervised_warmup_epochs > 0 and use_rl and is_rl_model:
             logging.info(f"=== SWITCHING TO RL FINE-TUNING (Epoch {epoch}) ===")
+            if rl_alternating_training and rl_alternating_freeze_encoder:
+                freeze_encoder(model)
         
-        if in_supervised_warmup:
-            logging.info(f"Epoch {epoch} [SUPERVISED WARMUP Phase - {epoch + 1}/{rl_supervised_warmup_epochs}]")
+        # === Phase transition: Alternating → Joint ===
+        if in_joint_phase and not joint_phase_started:
+            joint_phase_started = True
+            logging.info(f"")
+            logging.info(f"{'=' * 60}")
+            logging.info(f"=== SWITCHING TO PHASE 3: JOINT FINE-TUNING (Epoch {epoch}) ===")
+            logging.info(f"{'=' * 60}")
+            
+            # Unfreeze both policy and decoder
+            unfreeze_policy(model)
+            unfreeze_decoder(model)
+            # Encoder stays frozen
+            log_trainable_params(model)
+            
+            # Reduce noise scale for micro-adjustments
+            rl_model = _get_rl_model(model)
+            if hasattr(rl_model, 'policy') and hasattr(rl_model.policy, 'continuous_noise_scale'):
+                original_noise_scale = rl_model.policy.continuous_noise_scale
+                rl_model.policy.continuous_noise_scale = rl_joint_noise_scale
+                logging.info(f"  [JOINT] Noise scale: {original_noise_scale} → {rl_joint_noise_scale}")
+            
+            # Reduce learning rate by scaling all param group LRs
+            for param_group in optimizer.param_groups:
+                old_lr = param_group['lr']
+                param_group['lr'] = old_lr * rl_joint_lr_factor
+                logging.info(f"  [JOINT] LR: {old_lr:.2e} → {param_group['lr']:.2e}")
+            
+            logging.info(f"  [JOINT] Using best-rollout training for end-to-end polishing")
+            logging.info(f"{'=' * 60}")
+        
+        # === Phase transition: Value warmup → Full PPO ===
+        if rl_value_warmup_epochs > 0 and epoch == rl_value_warmup_epochs and use_rl and is_rl_model and not value_warmup_completed:
+            value_warmup_completed = True
+            logging.info(f"")
+            logging.info(f"{'=' * 60}")
+            logging.info(f"=== SWITCHING TO FULL PPO TRAINING (Epoch {epoch}) ===")
+            logging.info(f"{'=' * 60}")
+            unfreeze_for_ppo(model)
+            log_trainable_params(model)
+            logging.info(f"{'=' * 60}")
+        
+        # Log epoch info
+        if in_value_warmup:
+            logging.info(f"Epoch {epoch} [VALUE WARMUP - {epoch + 1}/{rl_value_warmup_epochs}]")
+        elif in_supervised_warmup:
+            logging.info(f"Epoch {epoch} [PHASE 1: SUPERVISED WARMUP - {epoch + 1}/{rl_supervised_warmup_epochs}]")
+        elif in_joint_phase:
+            joint_epoch_num = epoch - joint_start_epoch + 1
+            logging.info(f"Epoch {epoch} [PHASE 3: JOINT FINE-TUNING - {joint_epoch_num}/{rl_joint_finetune_epochs}]")
         elif use_rl_this_epoch:
-            logging.info(f"Epoch {epoch} [RL FINE-TUNING Phase - {epoch - rl_supervised_warmup_epochs + 1}/{cfg.epochs - rl_supervised_warmup_epochs}]")
+            if rl_value_warmup_epochs > 0:
+                ppo_epoch_num = epoch - rl_value_warmup_epochs + 1
+                total_ppo = cfg.epochs - rl_value_warmup_epochs
+                logging.info(f"Epoch {epoch} [FULL PPO - {ppo_epoch_num}/{total_ppo}]")
+            else:
+                rl_epoch_num = epoch - rl_supervised_warmup_epochs + 1
+                total_rl = alternating_end_epoch - rl_supervised_warmup_epochs
+                logging.info(f"Epoch {epoch} [PHASE 2: RL FINE-TUNING - {rl_epoch_num}/{total_rl}]")
         else:
             logging.info(f"Epoch {epoch}")
 
         save_checkpoint("experiment_state_rl.pth")
 
-        if use_rl_this_epoch:
+        if in_value_warmup:
+            # =============================================================
+            # VALUE WARMUP PHASE
+            # Only value_network trains; everything else frozen.
+            # Run RL rollouts to collect rewards, fit value function.
+            # =============================================================
             if cfg.get('rl_best_rollout_training', False):
                 rl_train_fn = run_rl_train_epoch_best_rollout
             elif cfg.get('rl_decoupled_training', False):
@@ -433,8 +748,109 @@ def main(cfg):
                 grpo,
                 reward_computer,
                 epoch,
-                desc="train",
+                desc="train [VALUE-WARMUP]",
             )
+        elif in_joint_phase:
+            # =============================================================
+            # PHASE 3: JOINT FINE-TUNING
+            # Both policy and decoder train together with low noise + low LR
+            # Uses best-rollout training for clean coupling
+            # =============================================================
+            if cfg.get('rl_best_rollout_training', False):
+                rl_train_fn = run_rl_train_epoch_best_rollout
+            elif cfg.get('rl_decoupled_training', False):
+                rl_train_fn = run_rl_train_epoch_decoupled
+            else:
+                rl_train_fn = run_rl_train_epoch_batched
+            rl_train_fn(
+                cfg,
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                lr_scheduler,
+                scaler,
+                grpo,
+                reward_computer,
+                epoch,
+                desc="train [JOINT]",
+            )
+        elif use_rl_this_epoch:
+            if in_alternating_phase:
+                # =============================================================
+                # PHASE 2: ALTERNATING TRAINING MODE
+                # Even offsets (0, 2, 4, ...): Train RL policy only
+                # Odd offsets (1, 3, 5, ...): Train decoder only
+                # =============================================================
+                rl_phase_epoch = epoch - rl_supervised_warmup_epochs
+                is_rl_turn = (rl_phase_epoch % 2 == 0)  # Start with RL
+                
+                if is_rl_turn:
+                    # RL POLICY EPOCH: freeze decoder, unfreeze policy
+                    logging.info(f"  >>> ALTERNATING: RL POLICY epoch (decoder frozen)")
+                    freeze_decoder(model)
+                    unfreeze_policy(model)
+                    log_trainable_params(model)
+                    
+                    if cfg.get('rl_best_rollout_training', False):
+                        rl_train_fn = run_rl_train_epoch_best_rollout
+                    elif cfg.get('rl_decoupled_training', False):
+                        rl_train_fn = run_rl_train_epoch_decoupled
+                    else:
+                        rl_train_fn = run_rl_train_epoch_batched
+                    rl_train_fn(
+                        cfg,
+                        model,
+                        train_loader,
+                        criterion,
+                        optimizer,
+                        lr_scheduler,
+                        scaler,
+                        grpo,
+                        reward_computer,
+                        epoch,
+                        desc="train [RL-POLICY]",
+                    )
+                else:
+                    # DECODER EPOCH: freeze policy, unfreeze decoder
+                    logging.info(f"  >>> ALTERNATING: DECODER epoch (policy frozen)")
+                    freeze_policy(model)
+                    unfreeze_decoder(model)
+                    log_trainable_params(model)
+                    
+                    # Use standard supervised training — no rollouts, deterministic attention
+                    run_train_epoch(
+                        cfg,
+                        model,
+                        train_loader,
+                        criterion,
+                        optimizer,
+                        lr_scheduler,
+                        scaler,
+                        epoch,
+                        desc="train [DECODER]",
+                    )
+            else:
+                # Standard (non-alternating) RL training
+                if cfg.get('rl_best_rollout_training', False):
+                    rl_train_fn = run_rl_train_epoch_best_rollout
+                elif cfg.get('rl_decoupled_training', False):
+                    rl_train_fn = run_rl_train_epoch_decoupled
+                else:
+                    rl_train_fn = run_rl_train_epoch_batched
+                rl_train_fn(
+                    cfg,
+                    model,
+                    train_loader,
+                    criterion,
+                    optimizer,
+                    lr_scheduler,
+                    scaler,
+                    grpo,
+                    reward_computer,
+                    epoch,
+                    desc="train",
+                )
         else:
             run_train_epoch(
                 cfg,
@@ -561,44 +977,72 @@ def compute_coords_inside_prostate_stats(rl_coords, prostate_mask):
 def run_train_epoch(
     args, model, loader, criterion, optimizer, scheduler, scaler, epoch, desc="Train"
 ):
-    """Standard training epoch (non-RL)"""
+    """Standard training epoch (non-RL). Supports SAM optimizer (two forward-backward passes)."""
     model.train()
     evaluator = Evaluator(**args.evaluator)
+    
+    # Detect if using SAM optimizer
+    _is_sam = hasattr(optimizer, 'first_step') and hasattr(optimizer, 'second_step')
+    if _is_sam:
+        logging.info("SAM optimizer detected — using two forward-backward passes per step")
 
     for train_iter, data in enumerate(tqdm(loader, desc=desc)):
 
         if args.debug and train_iter > 10:
             break
 
-        with torch.amp.autocast('cuda', enabled=args.use_amp):
+        if _is_sam:
+            # ============================================================
+            # SAM two-step training (no AMP — SAM doesn't support GradScaler)
+            # ============================================================
+            # First forward-backward pass
             data = model(data)
-
             if torch.any(torch.isnan(data["cancer_logits"])):
                 logging.warning("NaNs in heatmap logits")
-
             loss = criterion(data)
-
-        loss = loss / args.accumulate_grad_steps
-        
-        if args.use_amp:
-            scaler.scale(loss).backward()
-        else:
             loss.backward()
-
-        if (train_iter + 1) % args.accumulate_grad_steps == 0:
-            if args.use_amp:
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-            else:
-                optimizer.step()
-                optimizer.zero_grad()
+            optimizer.first_step(zero_grad=True)
             
-            # Step scheduler only when optimizer steps
+            # Second forward-backward pass (full recompute)
+            data_second = model(data)
+            loss_second = criterion(data_second)
+            loss_second.backward()
+            optimizer.second_step(zero_grad=True)
+            
             scheduler.step()
+        else:
+            # ============================================================
+            # Standard AdamW training
+            # ============================================================
+            with torch.amp.autocast('cuda', enabled=args.use_amp):
+                data = model(data)
+
+                if torch.any(torch.isnan(data["cancer_logits"])):
+                    logging.warning("NaNs in heatmap logits")
+
+                loss = criterion(data)
+
+            loss = loss / args.accumulate_grad_steps
+            
+            if args.use_amp:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            if (train_iter + 1) % args.accumulate_grad_steps == 0:
+                if args.use_amp:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                
+                # Step scheduler only when optimizer steps
+                scheduler.step()
 
         step_metrics = {f"train/{k}": v for k, v in evaluator(data).items()}
-        step_metrics.update({"train_loss": loss.item() * args.accumulate_grad_steps})
+        step_metrics.update({"train_loss": loss.item() * (1 if _is_sam else args.accumulate_grad_steps)})
         
         if hasattr(model, 'get_params_groups'):
             encoder_lr = optimizer.param_groups[0]["lr"]
@@ -1508,17 +1952,45 @@ def setup_optimizer(args, model, train_loader):
                 ) * niter_per_ep
                 return 0.5 * (1 + np.cos(np.pi * cur_iter / total_iter))
 
-    optimizer = AdamW(params, lr=args.lr, weight_decay=args.get('wd', 0))
-    from torch.optim.lr_scheduler import LambdaLR
-
-    lr_scheduler = LambdaLR(
-        optimizer,
-        [
-            lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
-            lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=False),
-            lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
-        ],
-    )
+    # Check if SAM optimizer is requested
+    use_sam = args.get('optimizer', 'adamw').lower() == 'sam'
+    
+    if use_sam:
+        import sys, os
+        sam_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'sam')
+        if sam_dir not in sys.path:
+            sys.path.insert(0, sam_dir)
+        from sam import SAM
+        
+        sam_rho = args.get('sam_rho', 0.05)
+        sam_adaptive = args.get('sam_adaptive', False)
+        logging.info(f"Using SAM optimizer (rho={sam_rho}, adaptive={sam_adaptive}) wrapping AdamW")
+        
+        optimizer = SAM(
+            params, AdamW, rho=sam_rho, adaptive=sam_adaptive,
+            lr=args.lr, weight_decay=args.get('wd', 0)
+        )
+        # LR scheduler should be attached to the base optimizer for SAM
+        from torch.optim.lr_scheduler import LambdaLR
+        lr_scheduler = LambdaLR(
+            optimizer.base_optimizer,
+            [
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=False),
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
+            ],
+        )
+    else:
+        optimizer = AdamW(params, lr=args.lr, weight_decay=args.get('wd', 0))
+        from torch.optim.lr_scheduler import LambdaLR
+        lr_scheduler = LambdaLR(
+            optimizer,
+            [
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=False),
+                lambda iter: compute_lr_multiplier(iter, is_encoder_or_cnn=True),
+            ],
+        )
 
     return optimizer, lr_scheduler
 
@@ -1533,6 +2005,7 @@ class ProstNFoundMeta(nn.Module):
         is_rl=False,
         apply_prostate_mask_to_decoder=False,
         boundary_tolerance_patches=0,
+        sar_noise_scale=0.0,
     ):
         super().__init__()
         self.model = model
@@ -1540,6 +2013,7 @@ class ProstNFoundMeta(nn.Module):
         self.is_rl = is_rl
         self.apply_prostate_mask_to_decoder = apply_prostate_mask_to_decoder
         self.boundary_tolerance_patches = boundary_tolerance_patches
+        self.sar_noise_scale = sar_noise_scale
 
         if isinstance(self.model, ProstNFound):
             logging.info(f"Model ProstNFound with prompts {self.model.prompts}")
@@ -1619,6 +2093,8 @@ class ProstNFoundMeta(nn.Module):
                 data["rl_value"] = outputs.get("rl_value")
                 if "rl_action_indices" in outputs:
                     data["rl_action_indices"] = outputs.get("rl_action_indices")
+                if "rl_bbox" in outputs:
+                    data["rl_bbox"] = outputs.get("rl_bbox")
         else:
             model_outputs = self.model(bmode)
             if isinstance(model_outputs, dict):
@@ -1683,6 +2159,31 @@ class ProstNFoundMeta(nn.Module):
             )
         
         data["cancer_logits"] = cancer_logits
+
+        # SAR: Stochastic Attention Regularization — second forward with noisy attention
+        if (self.sar_noise_scale > 0 and self.training and self.is_rl
+                and is_prostnfound_model and not deterministic):
+            rl_model = self.model
+            orig_noise = None
+            if hasattr(rl_model, 'policy') and hasattr(rl_model.policy, 'continuous_noise_scale'):
+                orig_noise = rl_model.policy.continuous_noise_scale
+                rl_model.policy.continuous_noise_scale = self.sar_noise_scale
+            noisy_outputs = self.model(
+                bmode, rf, prostate_mask, needle_mask,
+                output_mode="all", deterministic=False,
+                return_rl_info=False, **prompts
+            )
+            noisy_logits = noisy_outputs["mask_logits"]
+            if self.apply_prostate_mask_to_decoder:
+                # Reuse outside_mask computed above (always defined when apply_prostate_mask_to_decoder is True)
+                noisy_logits = torch.where(
+                    outside_mask.expand_as(noisy_logits),
+                    torch.full_like(noisy_logits, -100.0),
+                    noisy_logits
+                )
+            data["cancer_logits_noisy"] = noisy_logits
+            if orig_noise is not None:
+                rl_model.policy.continuous_noise_scale = orig_noise
 
         # compute predictions
         masks = (prostate_mask > 0.5) & (needle_mask > 0.5)
