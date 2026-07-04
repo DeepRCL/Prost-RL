@@ -163,6 +163,33 @@ Repeat for folds 1–4 with the matching checkpoint and `data.fold`. Optional: s
 
 Core-level scores are computed as the mean heatmap activation within the needle–prostate intersection; image-level csPCa scores come from the classification head. We report AUROC and sensitivity at fixed specificities (80% by default; 60% also reported for the classification head).
 
+## Inference on a single image
+
+We release the fold-0 EXP4 checkpoint (best on the tracked cross-validation metric, `val/core_auc_high_involvement`) for standalone use outside the training/eval pipeline: **[download link — add your hosted checkpoint URL here]**.
+
+`prostnfound/inference.py` loads that checkpoint and runs it on one B-mode micro-ultrasound image, with an optional prostate mask and clinical metadata:
+
+```bash
+cd prostnfound
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$(pwd)"
+export MEDSAM_CHECKPOINT_DIR=/path/to/checkpoints   # dir with medsam_vit_b_cpu.pth (see Setup above)
+
+python inference.py \
+  --checkpoint /path/to/EXP4-pairwise-ranking-rl-fold0-best_rl.pth \
+  --image /path/to/bmode.png \
+  --prostate-mask /path/to/prostate_mask.png \
+  --age 65 --psa 6.5 --psa-density 0.00015 --loc LBM \
+  --output heatmap.png
+```
+
+This prints a prostate-level cancer-likelihood score and an image-level csPCa probability, and saves a heatmap-over-bmode overlay to `--output`.
+
+Notes:
+- `--prostate-mask`, `--age`, `--psa`, `--psa-density`, and `--loc` are all optional. Omitted clinical values fall back to training-set averages; an omitted prostate mask falls back to treating the whole image as prostate tissue. **Supplying a real prostate segmentation mask is strongly recommended** — the RL attention policy is trained to look only inside the prostate, so without a mask it attends over the full field of view and heatmap quality degrades.
+- `--loc` is the biopsy/core location code (e.g. `LBM` = Left-Base-Medial, `RAL` = Right-Apex-Lateral); it encodes where in the gland the region of interest sits. Leave it out if unknown.
+- `MEDSAM_CHECKPOINT_DIR` is required even for inference-only use: it's used to build the model architecture skeleton before the fine-tuned EXP4 weights are loaded on top of it.
+- This is one fold of a 5-fold cross-validation study, not a single globally-trained model — see [Evaluation](#evaluation) for the other folds' checkpoints and per-fold metrics.
+
 ## Method at a glance
 
 Given an input image `x`, the MedSAM encoder produces spatial features `F = Enc(x) ∈ R^{C×H×W}`. The attention policy πθ processes `F` together with a clinical-metadata embedding `c` (age, PSA, PSAD, POS), gates `F` channel-wise, and produces spatial attention logits that are masked outside the prostate region and normalized to obtain `α`. Features are modulated via residual injection:

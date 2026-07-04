@@ -238,3 +238,4 @@ prostnfound/*.pdf
 prostnfound/out.csv
 prostnfound/out_pirads.csv
 wandb/
+prostnfound/heatmap_sample.png
