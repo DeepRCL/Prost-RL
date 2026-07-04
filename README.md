@@ -165,7 +165,7 @@ Core-level scores are computed as the mean heatmap activation within the needle�
 
 ## Inference on a single image
 
-We release the fold-0 EXP4 checkpoint (best on the tracked cross-validation metric, `val/core_auc_high_involvement`) for standalone use outside the training/eval pipeline: **[download link — add your hosted checkpoint URL here]**.
+We release one of the checkpoints (best on the tracked cross-validation metric, `val/core_auc_high_involvement`) for standalone use outside the training/eval pipeline: *[Model Checkpoint](https://drive.google.com/file/d/1IWTulJldtvNasQTF3P9u3zgoWUaibJze/view?usp=sharing)*.
 
 `prostnfound/inference.py` loads that checkpoint and runs it on one B-mode micro-ultrasound image, with an optional prostate mask and clinical metadata:
 
@@ -190,25 +190,21 @@ Notes:
 - `MEDSAM_CHECKPOINT_DIR` is required even for inference-only use: it's used to build the model architecture skeleton before the fine-tuned EXP4 weights are loaded on top of it.
 - This is one fold of a 5-fold cross-validation study, not a single globally-trained model — see [Evaluation](#evaluation) for the other folds' checkpoints and per-fold metrics.
 
-## Method at a glance
-
-Given an input image `x`, the MedSAM encoder produces spatial features `F = Enc(x) ∈ R^{C×H×W}`. The attention policy πθ processes `F` together with a clinical-metadata embedding `c` (age, PSA, PSAD, POS), gates `F` channel-wise, and produces spatial attention logits that are masked outside the prostate region and normalized to obtain `α`. Features are modulated via residual injection:
-
-```
-F̃ = F_proc ⊙ α
-E  = F + φ(F̃)
-```
-
-where `φ(·)` is a bias-free 1×1 projection with GELU. The shared modulated embeddings `E` feed both the heatmap decoder and the csPCa classifier; `α` is itself an interpretable spatial map of where the model attended.
-
-For weak proportional labels `q ∈ [0,1]` over the needle–prostate intersection, SCE replaces vanilla BCE to bound the gradient under model–label disagreement, and the pixel-entropy regularizer prevents the trivial "predict `q` everywhere" degeneracy by encouraging sharp, decisive heatmaps. APO then refines the policy with DRPO + pairwise ranking, where Gaussian noise on attention logits breaks the determinism of continuous spatial attention to enable rollout-based exploration.
 
 ## Citation
 
 If you use this code, please cite our paper and the ProstNFound+ baseline:
 
 ```bibtex
-coming soon...
+@misc{abootorabi2026learninglookreinforcementlearning,
+      title={Learning Where to Look: A Reinforcement Learning Framework for Robust Micro-Ultrasound Prostate Cancer Detection}, 
+      author={Mohammad Mahdi Abootorabi and Sina Namazi and Armin Saadat and Lyuyang Wang and Obed Dzikunu and Paul F. R. Wilson and Zhuoxin Guo and Brian Wodlinger and Parvin Mousavi and Purang Abolmaesumi},
+      year={2026},
+      eprint={2606.30951},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2606.30951}, 
+}
 ```
 
 ## License
