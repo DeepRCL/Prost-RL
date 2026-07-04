@@ -165,7 +165,7 @@ Core-level scores are computed as the mean heatmap activation within the needleâ
 
 ## Inference on a single image
 
-We release one of the checkpoints (best on the tracked cross-validation metric, `val/core_auc_high_involvement`) for standalone use outside the training/eval pipeline: *[Model Checkpoint](https://drive.google.com/file/d/1IWTulJldtvNasQTF3P9u3zgoWUaibJze/view?usp=sharing)*.
+We release one of the checkpoints (best on the tracked cross-validation metric, `val/core_auc_high_involvement`) for standalone use outside the training/eval pipeline: *[Prost-RL Model Checkpoint](https://drive.google.com/file/d/1IWTulJldtvNasQTF3P9u3zgoWUaibJze/view?usp=sharing)*.
 
 `prostnfound/inference.py` loads that checkpoint and runs it on one B-mode micro-ultrasound image, with an optional prostate mask and clinical metadata:
 
