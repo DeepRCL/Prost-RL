@@ -171,11 +171,10 @@ We release one of the checkpoints (best on the tracked cross-validation metric, 
 
 ```bash
 cd prostnfound
-export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$(pwd)"
 export MEDSAM_CHECKPOINT_DIR=/path/to/checkpoints   # dir with medsam_vit_b_cpu.pth (see Setup above)
 
 python inference.py \
-  --checkpoint /path/to/EXP4-pairwise-ranking-rl-fold0-best_rl.pth \
+  --checkpoint /path/to/best_rl.pth \
   --image /path/to/bmode.png \
   --prostate-mask /path/to/prostate_mask.png \
   --age 65 --psa 6.5 --psa-density 0.00015 --loc LBM \
