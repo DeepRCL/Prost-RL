@@ -19,7 +19,7 @@ Micro-ultrasound (µUS) is an emerging modality for prostate cancer (PCa) detect
 **Prost-RL** reframes µUS PCa detection as a spatially aware, policy-driven inference problem by learning **where to look before decoding**. It integrates a lightweight reinforcement-learning policy into a foundation-model encoder–decoder to produce interpretable spatial attention maps that act as soft prompts for both cancer-likelihood heatmap prediction and image-level classification.
 
 
-<img width="5545" height="2365" alt="pipeline (1) (1)" src="https://github.com/user-attachments/assets/955b3998-a97f-4034-9125-b772fb53ac8c" />
+<img width="3327" height="1422" alt="pipeline-MICCAI2026-Prost-RL-Poster - RL Novelty2" src="https://github.com/user-attachments/assets/a9a0c621-bbcf-497d-8b5c-ac7cd7fe800e" />
 
 
 
