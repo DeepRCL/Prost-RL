@@ -1,6 +1,6 @@
 # Prost-RL
 
-[![arXiv](https://img.shields.io/badge/arXiv-2606.05531-b31b1b.svg)](https://arxiv.org/abs/2606.30951) 
+[![MICCAI 2026](https://img.shields.io/badge/MICCAI_2026-Paper_0577-blue.svg)](https://papers.miccai.org/miccai-2026/0577-Paper6168.html)
 
 Official implementation of **Prost-RL**: a reinforcement-learning framework for robust micro-ultrasound prostate cancer detection, built on the ProstNFound+ backbone (MedSAM encoder–decoder with clinical prompts).
 
